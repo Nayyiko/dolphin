@@ -1,0 +1,68 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  GO_VERSION: "1.22"
+
+jobs:
+  # ═══ Stage 1: Lint & Test — 快速失败 ═══
+  lint-and-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Go Vet
+        run: go vet ./...
+
+      - name: Unit Tests
+        run: go test -race -count=1 -coverprofile=coverage.out ./...
+
+      - name: Coverage Check
+        run: |
+          COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
+          echo "Total coverage: $COVERAGE%"
+          THRESHOLD=50
+          if (( $(echo "$COVERAGE < $THRESHOLD" | bc -l) )); then
+            echo "❌ Coverage $COVERAGE% is below $THRESHOLD% threshold"
+            exit 1
+          fi
+          echo "✅ Coverage $COVERAGE% meets threshold"
+
+      - name: Build Check
+        run: go build ./...
+
+  # ═══ Stage 2: 构建产物可编译的二进制 ═══
+  build-binaries:
+    name: Build Binaries
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Build all components
+        run: |
+          go build -o bin/gateway ./cmd/gateway
+          go build -o bin/scheduler ./cmd/scheduler
+          go build -o bin/worker ./cmd/worker
+          echo "Built: $(ls bin/)"

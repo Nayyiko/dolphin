@@ -17,8 +17,11 @@ import (
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"github.com/yourname/dolphin/internal/pkg/config"
 	"github.com/yourname/dolphin/internal/pkg/etcdutil"
+	"github.com/yourname/dolphin/internal/pkg/metrics"
 	"github.com/yourname/dolphin/internal/pkg/model"
 	"github.com/yourname/dolphin/internal/scheduler/cron"
 	"github.com/yourname/dolphin/internal/scheduler/election"
@@ -153,6 +156,24 @@ func main() {
 		}
 	}()
 
+	// 周期更新 leader 指标
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if leaderElector.IsLeader() {
+					metrics.SchedulerIsLeader.Set(1)
+				} else {
+					metrics.SchedulerIsLeader.Set(0)
+				}
+			}
+		}
+	}()
+
 	// ── gRPC Server ──
 	grpcServer := grpc.NewServer()
 	svc.RegisterServer(grpcServer)
@@ -177,6 +198,8 @@ func main() {
 			case "/healthz":
 				w.WriteHeader(http.StatusOK)
 				_, _ = w.Write([]byte("ok"))
+			case "/metrics":
+				promhttp.Handler().ServeHTTP(w, r)
 			default:
 				http.NotFound(w, r)
 			}

@@ -1,0 +1,47 @@
+# ============================================================
+# 多阶段构建：网关镜像
+# 用法: docker build -t dolphin-gateway -f deployments/docker/Dockerfile.gateway .
+# ============================================================
+
+# ── Stage 1: Build ──
+FROM golang:1.22-alpine AS builder
+
+RUN apk add --no-cache git ca-certificates
+
+WORKDIR /build
+
+# 先拷贝依赖（利用 Docker 层缓存）
+COPY go.mod go.sum ./
+RUN go mod download
+
+# 拷贝源码
+COPY . .
+
+ARG VERSION=dev
+ARG BUILD_TIME=unknown
+ARG GIT_COMMIT=unknown
+
+# 静态编译（CGO 关闭），注入版本信息
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
+    -ldflags="-s -w -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME} -X main.GitCommit=${GIT_COMMIT}" \
+    -o /build/bin/gateway ./cmd/gateway
+
+# ── Stage 2: Runtime ──
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates tzdata curl \
+    && adduser -D -g '' dolphin \
+    && mkdir -p /app/configs
+
+USER dolphin
+WORKDIR /app
+
+COPY --from=builder /build/bin/gateway /app/gateway
+COPY configs/gateway.yaml /app/configs/gateway.yaml
+
+EXPOSE 8080
+HEALTHCHECK --interval=15s --timeout=3s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+ENTRYPOINT ["./gateway"]
+CMD ["-config", "/app/configs/gateway.yaml"]

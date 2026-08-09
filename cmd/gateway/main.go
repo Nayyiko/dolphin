@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"github.com/yourname/dolphin/internal/gateway/middleware"
 	"github.com/yourname/dolphin/internal/gateway/proxy"
 	"github.com/yourname/dolphin/internal/gateway/router"
@@ -45,8 +47,8 @@ func main() {
 
 	r := router.NewRouter()
 
-	// 中间件：Recovery 最外层（兜底 panic），Logger 记录访问。
-	r.Use(middleware.Recovery(), middleware.Logger())
+	// 中间件：Recovery 最外层（兜底 panic），Metrics 记录指标，Logger 记录访问。
+	r.Use(middleware.Recovery(), middleware.Metrics(), middleware.Logger())
 
 	// Redis 连接（限流用）。启动失败不致命——限流器 fail-open。
 	rdb := redisutil.NewClient(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
@@ -73,6 +75,9 @@ func main() {
 			"version":   Version,
 			"gitCommit": GitCommit,
 		})
+	})
+	r.GET("/metrics", func(c *router.Context) {
+		promhttp.Handler().ServeHTTP(c.Writer, c.Request)
 	})
 	r.GET("/", func(c *router.Context) {
 		c.String(http.StatusOK, "dolphin gateway\n")

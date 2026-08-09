@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"github.com/yourname/dolphin/internal/pkg/config"
 	"github.com/yourname/dolphin/internal/worker/client"
 	"github.com/yourname/dolphin/internal/worker/executor"
@@ -75,6 +77,8 @@ func main() {
 			case "/healthz":
 				w.WriteHeader(http.StatusOK)
 				_, _ = w.Write([]byte("ok"))
+			case "/metrics":
+				promhttp.Handler().ServeHTTP(w, r)
 			default:
 				http.NotFound(w, r)
 			}

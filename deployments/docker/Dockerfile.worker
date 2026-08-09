@@ -1,0 +1,41 @@
+# ============================================================
+# 多阶段构建：Worker 镜像
+# ============================================================
+
+FROM golang:1.22-alpine AS builder
+
+RUN apk add --no-cache git ca-certificates
+
+WORKDIR /build
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+ARG VERSION=dev
+ARG BUILD_TIME=unknown
+ARG GIT_COMMIT=unknown
+
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
+    -ldflags="-s -w -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME} -X main.GitCommit=${GIT_COMMIT}" \
+    -o /build/bin/worker ./cmd/worker
+
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates tzdata curl \
+    && adduser -D -g '' dolphin \
+    && mkdir -p /app/configs
+
+USER dolphin
+WORKDIR /app
+
+COPY --from=builder /build/bin/worker /app/worker
+COPY configs/worker.yaml /app/configs/worker.yaml
+
+EXPOSE 9090
+HEALTHCHECK --interval=15s --timeout=3s --retries=3 \
+    CMD curl -f http://localhost:9090/healthz || exit 1
+
+ENTRYPOINT ["./worker"]
+CMD ["-config", "/app/configs/worker.yaml"]
