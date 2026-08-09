@@ -1,0 +1,36 @@
+# Binaries
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test
+coverage.out
+coverage.html
+*.test
+*.prof
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+vendor/
+
+# Docker
+.docker/
+
+# Configs (keep .example, ignore real secrets)
+configs/*.yaml
+!configs/*.example.yaml
+
+# Proto generated
+api/proto/pb/
