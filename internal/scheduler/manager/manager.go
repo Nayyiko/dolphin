@@ -28,6 +28,11 @@ func NewManager(db *gorm.DB) *Manager {
 	return &Manager{db: db}
 }
 
+// DB 返回底层 gorm.DB（供服务层直接查询）。
+func (m *Manager) DB() *gorm.DB {
+	return m.db
+}
+
 // AutoMigrate 自动建表。
 func (m *Manager) AutoMigrate() error {
 	return m.db.AutoMigrate(

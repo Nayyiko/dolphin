@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -9,8 +10,11 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/yourname/dolphin/internal/pkg/config"
+	"github.com/yourname/dolphin/internal/worker/client"
+	"github.com/yourname/dolphin/internal/worker/executor"
 )
 
 var (
@@ -36,6 +40,33 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 生成 worker ID（模拟：用 hostname + 端口）
+	hostname, _ := os.Hostname()
+	workerID := fmt.Sprintf("%s-%d", hostname, os.Getpid())
+
+	// 创建协程池
+	pool := executor.NewPool(cfg.Pool.Capacity, nil)
+
+	// 创建 gRPC 客户端
+	clientCfg := client.Config{
+		SchedulerAddr:  cfg.Scheduler.Addr,
+		WorkerID:       workerID,
+		Address:        "localhost:" + fmt.Sprintf("%d", cfg.Server.MetricsPort),
+		MaxConcurrency: cfg.Pool.Capacity,
+	}
+	cl, err := client.New(clientCfg, pool)
+	if err != nil {
+		slog.Error("connect to scheduler failed", "err", err)
+		os.Exit(1)
+	}
+
+	// 将结果上报器注入协程池
+	pool.SetReporter(cl)
+
+	// 运行客户端（注册 + 心跳 + 收任务）——阻塞直到 ctx 取消
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// metrics HTTP server
 	httpServer := &http.Server{
 		Addr:    ":" + fmt.Sprintf("%d", cfg.Server.MetricsPort),
@@ -49,17 +80,32 @@ func main() {
 			}
 		}),
 	}
-
 	go func() {
 		slog.Info("worker metrics listening", "port", cfg.Server.MetricsPort)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			slog.Error("http server error", "err", err)
-			os.Exit(1)
+			slog.Error("metrics server error", "err", err)
+		}
+	}()
+
+	// 运行客户端
+	go func() {
+		if err := cl.Run(ctx); err != nil {
+			slog.Error("worker client stopped", "err", err)
+			cancel()
 		}
 	}()
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
+	slog.Info("worker shutting down...")
+
+	// 优雅关闭
+	cancel()
+	_ = cl.Close()
+	pool.Shutdown()
+	shutdownCtx, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	_ = httpServer.Shutdown(shutdownCtx)
 	slog.Info("worker stopped")
 }

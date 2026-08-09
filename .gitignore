@@ -31,6 +31,3 @@ vendor/
 # Configs (keep .example, ignore real secrets)
 configs/*.yaml
 !configs/*.example.yaml
-
-# Proto generated
-api/proto/pb/

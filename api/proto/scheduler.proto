@@ -1,0 +1,177 @@
+syntax = "proto3";
+
+package dolphin;
+option go_package = "github.com/yourname/dolphin/api/proto/pb";
+
+// Scheduler gRPC 服务。
+service Scheduler {
+  // Connect Worker 与 Scheduler 之间的双向流：
+  //   Worker → Scheduler: Register / Heartbeat / TaskResult
+  //   Scheduler → Worker: RegisterAck / TaskDispatch / HeartbeatAck
+  rpc Connect(stream WorkerMessage) returns (stream SchedulerMessage);
+
+  // ---- Task 管理 API（由网关调用）----
+  rpc CreateTask(CreateTaskRequest) returns (Task);
+  rpc GetTask(GetTaskRequest) returns (Task);
+  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
+  rpc UpdateTask(UpdateTaskRequest) returns (Task);
+  rpc DeleteTask(DeleteTaskRequest) returns (Empty);
+  rpc PauseTask(PauseTaskRequest) returns (Task);
+  rpc ResumeTask(ResumeTaskRequest) returns (Task);
+  rpc TriggerTask(TriggerTaskRequest) returns (Empty); // 手动触发
+  rpc GetTaskLogs(GetTaskLogsRequest) returns (GetTaskLogsResponse);
+}
+
+// ==================== 任务定义 ====================
+
+message Task {
+  string id = 1;
+  string name = 2;
+  string cron_expr = 3;
+  int64 next_run_at = 4; // unix 秒
+  string handler = 5;
+  string handler_type = 6;
+  string params = 7; // JSON
+  int32 timeout = 8;
+  int32 max_retries = 9;
+  string status = 10; // active/paused/deleted
+  int64 created_at = 11;
+  int64 updated_at = 12;
+}
+
+message Empty {}
+
+message CreateTaskRequest {
+  string name = 1;
+  string cron_expr = 2;
+  string handler = 3;
+  string handler_type = 4;
+  string params = 5;
+  int32 timeout = 6;
+  int32 max_retries = 7;
+}
+
+message GetTaskRequest {
+  string id = 1;
+}
+
+message ListTasksRequest {
+  string status = 1;
+  int32 offset = 2;
+  int32 limit = 3;
+}
+
+message ListTasksResponse {
+  repeated Task tasks = 1;
+  int64 total = 2;
+}
+
+message UpdateTaskRequest {
+  string id = 1;
+  string name = 2;
+  string cron_expr = 3;
+  string handler = 4;
+  string handler_type = 5;
+  string params = 6;
+  int32 timeout = 7;
+  int32 max_retries = 8;
+}
+
+message DeleteTaskRequest {
+  string id = 1;
+}
+
+message PauseTaskRequest {
+  string id = 1;
+}
+
+message ResumeTaskRequest {
+  string id = 1;
+}
+
+message TriggerTaskRequest {
+  string id = 1;
+}
+
+message TaskLogEntry {
+  string id = 1;
+  string task_id = 2;
+  string instance_id = 3;
+  string worker_id = 4;
+  string status = 5;
+  int64 start_time = 6;
+  int64 end_time = 7;
+  string result = 8;
+  string error_msg = 9;
+  int32 retry_count = 10;
+}
+
+message GetTaskLogsRequest {
+  string task_id = 1;
+  int32 limit = 2;
+}
+
+message GetTaskLogsResponse {
+  repeated TaskLogEntry logs = 1;
+}
+
+// ==================== Worker ↔ Scheduler 双向流 ====================
+
+message WorkerMessage {
+  oneof msg {
+    RegisterRequest register = 1;
+    Heartbeat heartbeat = 2;
+    TaskResult task_result = 3;
+  }
+}
+
+message SchedulerMessage {
+  oneof msg {
+    RegisterResponse register_ack = 1;
+    TaskDispatch dispatch = 2;
+    HeartbeatAck heartbeat_ack = 3;
+    CancelTask cancel = 4;
+  }
+}
+
+message RegisterRequest {
+  string worker_id = 1;
+  string address = 2;
+  int32 max_concurrency = 3;
+}
+
+message RegisterResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message Heartbeat {
+  string worker_id = 1;
+  int32 current_load = 2;
+}
+
+message HeartbeatAck {
+  bool ok = 1;
+}
+
+message TaskDispatch {
+  string task_id = 1;
+  string instance_id = 2;
+  string handler = 3;
+  string handler_type = 4;
+  string params = 5;
+  int32 timeout = 6;
+}
+
+message TaskResult {
+  string instance_id = 1;
+  string task_id = 2;
+  string worker_id = 3;
+  string status = 4; // success/failed/timeout
+  string result = 5;
+  string error_msg = 6;
+}
+
+message CancelTask {
+  string instance_id = 1;
+}
