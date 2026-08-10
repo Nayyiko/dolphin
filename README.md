@@ -113,15 +113,25 @@ dolphin/
 ## 测试与基准
 
 ```bash
-make test        # 单元测试
-make bench       # 基准测试
+make test           # 单元测试
+make bench          # 微基准测试
+make smoke          # 端到端冒烟测试（需启动组件）
+make bench-gateway  # 网关压测
+make bench-schedule # 调度压测
+make failover       # 故障注入测试
 ```
+
+### 微基准（函数级）
 
 | Benchmark | 结果 |
 |-----------|------|
 | Radix 静态路由匹配 | ~92 ns/op |
 | Radix 参数路由匹配 | ~290 ns/op |
 | Cron Next() 计算 | ~663 ns/op, 0 alloc |
+
+### 系统级压测（需本机 Docker 环境）
+
+完整验证与压测方法见 [docs/benchmark.md](docs/benchmark.md)，包括端到端冒烟、网关 QPS/延迟压测、调度吞吐压测、故障注入测试。
 
 ## 设计文档
 

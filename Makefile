@@ -1,6 +1,6 @@
 # Dolphin — 构建系统
 
-.PHONY: help proto lint test test-cover bench build build-linux docker-build infra-up infra-down run-gateway run-scheduler run-worker clean
+.PHONY: help proto lint test test-cover bench build build-linux docker-build infra-up infra-down run-gateway run-scheduler run-worker smoke bench-gateway bench-schedule failover clean
 
 APP_NAME := dolphin
 REGISTRY := docker.io/$(USER)
@@ -52,7 +52,13 @@ build: ## 编译所有二进制
 	$(GO) build -trimpath -ldflags="$(LDFLAGS)" -o bin/gateway    ./cmd/gateway
 	$(GO) build -trimpath -ldflags="$(LDFLAGS)" -o bin/scheduler  ./cmd/scheduler
 	$(GO) build -trimpath -ldflags="$(LDFLAGS)" -o bin/worker     ./cmd/worker
+	$(GO) build -trimpath -ldflags="$(LDFLAGS)" -o bin/dolphinctl ./cmd/dolphinctl
 	@echo "Build complete: $(shell ls bin/)"
+
+build-ctl: ## 仅编译 dolphinctl
+	@echo "Building dolphinctl..."
+	$(GO) build -trimpath -ldflags="$(LDFLAGS)" -o bin/dolphinctl ./cmd/dolphinctl
+	@echo "Built bin/dolphinctl"
 
 build-linux: ## 交叉编译 Linux amd64
 	@echo "Cross-compiling for linux/amd64..."
@@ -83,6 +89,19 @@ run-scheduler: ## 启动 Scheduler
 
 run-worker: ## 启动 Worker
 	$(GO) run ./cmd/worker -config=configs/worker.yaml
+
+# ─── 验证与压测 ───
+smoke: ## 端到端冒烟测试（需先启动基础设施和组件）
+	./hack/smoke_test.sh
+
+bench-gateway: ## 网关压测 [QPS] [DURATION]
+	./hack/bench_gateway.sh $(QPS) $(DURATION)
+
+bench-schedule: ## 调度压测 [COUNT]
+	./hack/bench_schedule.sh $(COUNT)
+
+failover: ## 故障注入测试（Worker 宕机恢复）
+	./hack/test_failover.sh
 
 clean: ## 清理构建产物
 	rm -rf bin/

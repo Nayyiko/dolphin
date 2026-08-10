@@ -11,6 +11,9 @@ coverage.html
 *.test
 *.prof
 
+# 压测结果
+results/
+
 # IDE
 .idea/
 .vscode/
@@ -27,7 +30,3 @@ vendor/
 
 # Docker
 .docker/
-
-# Configs (keep .example, ignore real secrets)
-configs/*.yaml
-!configs/*.example.yaml

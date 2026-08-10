@@ -1,0 +1,8 @@
+server:
+  metrics_port: 9090
+scheduler:
+  addr: localhost:50051
+pool:
+  capacity: 50
+heartbeat:
+  interval: 10s
