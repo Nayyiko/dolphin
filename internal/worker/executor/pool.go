@@ -10,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/yourname/dolphin/internal/pkg/metrics"
 )
 
 // TaskDispatch 下发的任务。
@@ -104,6 +106,14 @@ func (p *Pool) CurrentLoad() int {
 // execute 执行单个任务，带超时控制。
 func (p *Pool) execute(task *TaskDispatch) {
 	defer p.currentLoad.Add(-1)
+	// 更新池利用率指标
+	metrics.WorkerPoolUtilization.Set(float64(p.CurrentLoad()) / float64(p.capacity))
+	defer func() {
+		metrics.WorkerPoolUtilization.Set(float64(p.CurrentLoad()) / float64(p.capacity))
+	}()
+
+	metrics.RecordWorkerTaskStarted()
+	start := time.Now()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(task.Timeout)*time.Second)
 	defer cancel()
@@ -116,6 +126,7 @@ func (p *Pool) execute(task *TaskDispatch) {
 	select {
 	case result := <-done:
 		p.report(ctx, result)
+		metrics.RecordWorkerTaskCompleted(task.HandlerType, time.Since(start), result.Status)
 	case <-ctx.Done():
 		p.report(ctx, &TaskResult{
 			InstanceID: task.InstanceID,
@@ -123,6 +134,7 @@ func (p *Pool) execute(task *TaskDispatch) {
 			Status:     "timeout",
 			ErrorMsg:   "task execution timed out after " + (time.Duration(task.Timeout) * time.Second).String(),
 		})
+		metrics.RecordWorkerTaskCompleted(task.HandlerType, time.Since(start), "timeout")
 	}
 }
 

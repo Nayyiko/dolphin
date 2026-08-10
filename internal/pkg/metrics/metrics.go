@@ -222,3 +222,37 @@ func RecordAPIMetrics(method, path string, statusCode int, duration time.Duratio
 		GatewayErrorsTotal.WithLabelValues(method, path, "5xx").Inc()
 	}
 }
+
+// RecordDispatch 调度器下发任务时记录调度计数和调度延迟。
+// lag = 任务到期(next_run_at)到实际下发的耗时。
+func RecordDispatch(taskID, workerID string, lag time.Duration, success bool) {
+	result := "success"
+	if !success {
+		result = "failed"
+	}
+	SchedulerDispatchTotal.WithLabelValues(taskID, workerID, result).Inc()
+	SchedulerTaskLag.Observe(lag.Seconds())
+}
+
+// RecordReconcile reconcile 循环耗时。
+func RecordReconcile(d time.Duration) {
+	SchedulerReconcileDuration.Observe(d.Seconds())
+}
+
+// RecordMissedSchedule 漏调度计数。
+func RecordMissedSchedule() {
+	SchedulerMissedSchedules.Inc()
+}
+
+// RecordWorkerTaskStarted worker 开始执行任务。
+func RecordWorkerTaskStarted() {
+	WorkerTasksExecuting.Inc()
+	// 池利用率由调用方设置，这里只维护 executing 计数。
+}
+
+// RecordWorkerTaskCompleted worker 完成任务，记录耗时和状态。
+func RecordWorkerTaskCompleted(handlerType string, duration time.Duration, status string) {
+	WorkerTasksExecuting.Dec()
+	WorkerTaskDuration.WithLabelValues(handlerType).Observe(duration.Seconds())
+	WorkerTaskCompleted.WithLabelValues(status).Inc()
+}

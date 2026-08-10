@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
+	"github.com/yourname/dolphin/internal/pkg/metrics"
 	"github.com/yourname/dolphin/internal/pkg/model"
 	"github.com/yourname/dolphin/internal/scheduler/informer"
 	"github.com/yourname/dolphin/internal/scheduler/manager"
@@ -109,7 +110,9 @@ func (r *Reconciler) worker(ctx context.Context) {
 		if shutdown {
 			return
 		}
+		start := time.Now()
 		err := r.reconcile(ctx, key)
+		metrics.RecordReconcile(time.Since(start))
 		if err != nil {
 			// 失败 → 限速重新入队（指数退避）
 			slog.Warn("reconcile failed, rate-limited requeue", "task_id", key, "err", err)
@@ -203,6 +206,13 @@ func (r *Reconciler) dispatch(ctx context.Context, task *model.Task) error {
 		return err
 	}
 
+	// 记录调度指标：计数 + 调度延迟（任务到期时间 → 实际下发时间）
+	lag := time.Since(task.NextRunAt)
+	if lag < 0 {
+		lag = 0 // 手动触发时 next_run_at 可能被设为过去，取 0
+	}
+	metrics.RecordDispatch(task.ID, result.WorkerID, lag, true)
+
 	// 记录执行日志
 	instanceID := result.InstanceID
 	if instanceID == "" {
@@ -246,6 +256,7 @@ func (r *Reconciler) dispatch(ctx context.Context, task *model.Task) error {
 func (r *Reconciler) handleMissedSchedule(ctx context.Context, task *model.Task) {
 	// 如果任务已经严重过期（> 5 分钟）且没有运行实例，说明漏调度了
 	if time.Since(task.NextRunAt) > 5*time.Minute && !r.hasRunningInstance(ctx, task.ID) {
+		metrics.RecordMissedSchedule()
 		slog.Warn("missed schedule detected", "task_id", task.ID,
 			"next_run_at", task.NextRunAt)
 		// 立即补一次调度
