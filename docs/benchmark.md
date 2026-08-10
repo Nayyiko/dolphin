@@ -67,7 +67,7 @@ make smoke
 
 ```bash
 curl localhost:9090/metrics | grep dolphin_scheduler
-curl localhost:9090/metrics | grep dolphin_worker
+curl localhost:9091/metrics | grep dolphin_worker
 curl localhost:8080/metrics | grep dolphin_gateway
 ```
 

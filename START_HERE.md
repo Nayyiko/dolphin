@@ -209,7 +209,7 @@ failover:
 configs/worker.yaml：
 ```yaml
 server:
-  metrics_port: 9090
+  metrics_port: 9091
 scheduler:
   addr: localhost:50051
 pool:
