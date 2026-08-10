@@ -53,6 +53,7 @@ build: ## 编译所有二进制
 	$(GO) build -trimpath -ldflags="$(LDFLAGS)" -o bin/scheduler  ./cmd/scheduler
 	$(GO) build -trimpath -ldflags="$(LDFLAGS)" -o bin/worker     ./cmd/worker
 	$(GO) build -trimpath -ldflags="$(LDFLAGS)" -o bin/dolphinctl ./cmd/dolphinctl
+	$(GO) build -trimpath -ldflags="$(LDFLAGS)" -o bin/loadgen    ./cmd/loadgen
 	@echo "Build complete: $(shell ls bin/)"
 
 build-ctl: ## 仅编译 dolphinctl
@@ -102,6 +103,9 @@ bench-schedule: ## 调度压测 [COUNT]
 
 failover: ## 故障注入测试（Worker 宕机恢复）
 	./hack/test_failover.sh
+
+bench-full: ## 完整闭环压测（Windows: powershell .\hack\bench_full.ps1）
+	@echo "Windows 下运行: powershell -ExecutionPolicy Bypass .\\hack\\bench_full.ps1"
 
 clean: ## 清理构建产物
 	rm -rf bin/

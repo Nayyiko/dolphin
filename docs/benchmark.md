@@ -127,6 +127,39 @@ make failover
 |------|-----|----------------|
 | 故障转移恢复时间 | < 30s | ____ |
 
+### D. 完整闭环压测（一键）
+
+无需安装 wrk/vegeta——内置 `loadgen`（Go 实现）。Windows 下运行：
+
+```powershell
+# 1. 构建压测工具
+go build -o bin\dolphinctl.exe ./cmd/dolphinctl
+go build -o bin\loadgen.exe ./cmd/loadgen
+
+# 2. 一键完整闭环压测（环境检查→网关压测→批量建任务→等调度→抓指标→出报告）
+.\hack\bench_full.ps1
+```
+
+报告自动保存到 `results/bench-report.txt`，包含：
+
+| 阶段 | 数据 |
+|------|------|
+| 网关压测 | QPS、P50/P95/P99 延迟、错误率 |
+| 任务创建 | 创建速率 tasks/sec |
+| 调度 | dispatch 总数、调度延迟均值 |
+| Worker 执行 | 完成数、平均执行耗时、按状态拆分 |
+| 网关 | 总请求数、错误数 |
+
+### 单独用 loadgen 压测
+
+```bash
+# 50 并发打 10 秒
+loadgen -url http://localhost:8080/health -concurrency 50 -duration 10s
+
+# 限制 1000 QPS 打 30 秒
+loadgen -url http://localhost:8080/health -qps 1000 -duration 30s
+```
+
 ---
 
 ## 三、需要实际跑出来的数据（面试汇报）
@@ -138,8 +171,9 @@ make failover
 | 3 | 任务创建吞吐 | 证明批量创建能力（dolphinctl stress create） |
 | 4 | 故障恢复时间 | 证明 Failover SLO |
 | 5 | 一次完整冒烟测试输出 | 证明端到端链路 |
+| 6 | Worker 执行耗时 | 证明执行链路真实（如 39.7ms/次） |
 
-跑完后把数字填进本文件的表格，或者更新 README 的压测章节。
+跑完 `bench_full.ps1` 后，把 `results/bench-report.txt` 里的数字填进上文的表格，并更新 README 的压测章节。
 
 ---
 

@@ -121,6 +121,14 @@ make bench-schedule # 调度压测
 make failover       # 故障注入测试
 ```
 
+完整闭环压测（Windows，内置 loadgen，无需 wrk/vegeta）：
+
+```powershell
+go build -o bin\dolphinctl.exe ./cmd/dolphinctl
+go build -o bin\loadgen.exe ./cmd/loadgen
+.\hack\bench_full.ps1   # 一键: 环境检查→网关压测→批量建任务→调度指标→完整报告
+```
+
 ### 微基准（函数级）
 
 | Benchmark | 结果 |
