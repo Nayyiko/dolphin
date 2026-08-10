@@ -217,7 +217,8 @@ try {
 
     # 按状态拆分
     foreach ($st in @("success", "failed", "timeout")) {
-        $sc = [regex]::Match($wm, "dolphin_worker_task_completed_total\{status=\"$st\"\} ([0-9]+)")
+        $pattern = 'dolphin_worker_task_completed_total\{status="' + $st + '"\} ([0-9]+)'
+        $sc = [regex]::Match($wm, $pattern)
         if ($sc.Success) { Write-Result "  状态 $st : $($sc.Groups[1].Value)" }
     }
 } catch {
