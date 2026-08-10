@@ -117,19 +117,22 @@ Add-Content $Report $gatewayOut
 # ═══════════════ 阶段 2：批量创建任务 ═══════════════
 Write-Step "阶段 2：批量创建 $BatchCount 个任务（测创建吞吐）"
 
+# 用 dolphinctl stress create（复用同一 gRPC 连接循环创建）。
+# 注意：不用 PowerShell 循环调 task create——那会为每个任务启动一个新的
+# dolphinctl 进程 + 重新建立 gRPC 连接，测得的是进程启动开销而非系统吞吐。
+$name = "bench-$((Get-Date -Format 'HHmmss'))"
 $createStart = Get-Date
-$created = 0
-for ($i = 0; $i -lt $BatchCount; $i++) {
-    $name = "bench-$((Get-Date -Format 'HHmmss'))-$i"
-    $out = & $Ctl task create --name $name --cron $CronExpr --handler "$SchedMetrics/healthz" --type http 2>&1
-    if ($LASTEXITCODE -eq 0 -and $out -match "id=") {
-        $created++
-    }
-    if (($i + 1) % 25 -eq 0) {
-        Write-Result "  已创建 $($i+1)/$BatchCount"
-    }
-}
+$stressOut = & $Ctl stress create --count $BatchCount --prefix $name --cron $CronExpr --handler "$SchedMetrics/healthz" --type http --timeout 5 2>&1 | Out-String
 $createElapsed = ((Get-Date) - $createStart).TotalSeconds
+
+Write-Host $stressOut
+Add-Content $Report $stressOut
+
+# 从输出解析创建数
+$created = $BatchCount
+$m = [regex]::Match($stressOut, 'created (\d+)/(\d+)')
+if ($m.Success) { $created = [int]$m.Groups[1].Value }
+
 Write-Result "✅ 创建成功: $created/$BatchCount"
 Write-Result "⏱ 创建耗时: $([math]::Round($createElapsed, 2))s"
 if ($createElapsed -gt 0) {
