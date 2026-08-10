@@ -50,6 +50,20 @@ function Write-Result([string]$line) {
     Add-Content $Report $line
 }
 
+# Get-HTTP 用 curl.exe 获取 URL 内容。
+# 用 curl.exe 而非 Invoke-WebRequest 是为了绕开 PowerShell 的系统代理设置
+# （代理环境下 Invoke-WebRequest 访问 localhost 会超时）。
+# 返回 string，失败返回空字符串。
+function Get-HTTP([string]$url) {
+    try {
+        $result = & curl.exe -s --max-time 5 $url 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            return ($result -join "`n")
+        }
+    } catch { }
+    return ""
+}
+
 # 清空旧报告
 "" | Set-Content $Report
 Write-Host "Dolphin 完整闭环压测报告 $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" | Out-File $Report -Append
@@ -65,16 +79,11 @@ $checks = @(
 
 $envOK = $true
 foreach ($c in $checks) {
-    try {
-        $r = Invoke-WebRequest -Uri $c.Url -UseBasicParsing -TimeoutSec 3
-        if ($r.StatusCode -eq 200) {
-            Write-Result "✅ $($c.Name) 可达"
-        } else {
-            Write-Result "❌ $($c.Name) 状态码 $($r.StatusCode)"
-            $envOK = $false
-        }
-    } catch {
-        Write-Result "❌ $($c.Name) 不可达: $($_.Exception.Message)"
+    $body = Get-HTTP $c.Url
+    if ($body -ne "") {
+        Write-Result "✅ $($c.Name) 可达"
+    } else {
+        Write-Result "❌ $($c.Name) 不可达"
         $envOK = $false
     }
 }
@@ -132,24 +141,24 @@ Write-Step "阶段 3：等待一轮自然调度（最多 90s）"
 Write-Result "等待 cron 到期触发...（$CronExpr）"
 
 $dispatchBefore = 0
-try {
-    $m = Invoke-WebRequest -Uri "$SchedMetrics/metrics" -UseBasicParsing -TimeoutSec 3
-    $dispatchBefore = ([regex]::Matches($m.Content, 'dolphin_scheduler_dispatch_total\{(.*?)\} ([0-9]+)') | ForEach-Object { [int]$_.Groups[2].Value } | Measure-Object -Sum).Sum
-} catch { }
+$m = Get-HTTP "$SchedMetrics/metrics"
+if ($m -ne "") {
+    $dispatchBefore = ([regex]::Matches($m, 'dolphin_scheduler_dispatch_total\{(.*?)\} ([0-9]+)') | ForEach-Object { [int]$_.Groups[2].Value } | Measure-Object -Sum).Sum
+}
 
 $waited = 0
 while ($waited -lt 90) {
     Start-Sleep -Seconds 5
     $waited += 5
 
-    try {
-        $m = Invoke-WebRequest -Uri "$SchedMetrics/metrics" -UseBasicParsing -TimeoutSec 3
-        $dispatchAfter = ([regex]::Matches($m.Content, 'dolphin_scheduler_dispatch_total\{(.*?)\} ([0-9]+)') | ForEach-Object { [int]$_.Groups[2].Value } | Measure-Object -Sum).Sum
+    $m = Get-HTTP "$SchedMetrics/metrics"
+    if ($m -ne "") {
+        $dispatchAfter = ([regex]::Matches($m, 'dolphin_scheduler_dispatch_total\{(.*?)\} ([0-9]+)') | ForEach-Object { [int]$_.Groups[2].Value } | Measure-Object -Sum).Sum
         if ($dispatchAfter -gt $dispatchBefore) {
             Write-Result "✅ 检测到调度发生（等待 $waited s）"
             break
         }
-    } catch { }
+    }
 
     if ($waited -eq 90) {
         Write-Result "⚠️ 90s 内未检测到调度（可能 cron 尚未触发，或已错过窗口）"
@@ -166,7 +175,8 @@ Write-Step "阶段 4：完整闭环指标"
 # 4.1 调度器指标
 Write-Result "── 调度器指标 (9090) ──"
 try {
-    $sm = (Invoke-WebRequest -Uri "$SchedMetrics/metrics" -UseBasicParsing -TimeoutSec 3).Content
+    $sm = Get-HTTP "$SchedMetrics/metrics"
+    if ($sm -eq "") { throw "empty response" }
 
     # dispatch total
     $dispatchTotal = ([regex]::Matches($sm, 'dolphin_scheduler_dispatch_total\{(.*?)\} ([0-9]+)') | ForEach-Object { [int]$_.Groups[2].Value } | Measure-Object -Sum).Sum
@@ -199,7 +209,8 @@ try {
 Write-Result ""
 Write-Result "── Worker 指标 (9091) ──"
 try {
-    $wm = (Invoke-WebRequest -Uri "$WorkerMetrics/metrics" -UseBasicParsing -TimeoutSec 3).Content
+    $wm = Get-HTTP "$WorkerMetrics/metrics"
+    if ($wm -eq "") { throw "empty response" }
 
     $completed = ([regex]::Matches($wm, 'dolphin_worker_task_completed_total\{(.*?)\} ([0-9]+)') | ForEach-Object { [int]$_.Groups[2].Value } | Measure-Object -Sum).Sum
     Write-Result "总完成执行数: $completed"
@@ -229,7 +240,8 @@ try {
 Write-Result ""
 Write-Result "── 网关指标 (8080) ──"
 try {
-    $gm = (Invoke-WebRequest -Uri "$Gateway/metrics" -UseBasicParsing -TimeoutSec 3).Content
+    $gm = Get-HTTP "$Gateway/metrics"
+    if ($gm -eq "") { throw "empty response" }
     $reqTotal = ([regex]::Matches($gm, 'dolphin_gateway_requests_total\{(.*?)\} ([0-9]+)') | ForEach-Object { [int]$_.Groups[2].Value } | Measure-Object -Sum).Sum
     Write-Result "网关总请求数: $reqTotal"
     $errTotal = ([regex]::Matches($gm, 'dolphin_gateway_errors_total\{(.*?)\} ([0-9]+)') | ForEach-Object { [int]$_.Groups[2].Value } | Measure-Object -Sum).Sum
