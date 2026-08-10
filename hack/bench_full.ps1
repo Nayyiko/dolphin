@@ -128,9 +128,9 @@ $createElapsed = ((Get-Date) - $createStart).TotalSeconds
 Write-Host $stressOut
 Add-Content $Report $stressOut
 
-# 从输出解析创建数
+# 从输出解析创建数（只匹配最终结果行 "created 100/100 tasks in ..."，不匹配进度行 "  created 20/100"）
 $created = $BatchCount
-$m = [regex]::Match($stressOut, 'created (\d+)/(\d+)')
+$m = [regex]::Match($stressOut, 'created (\d+)/(\d+) tasks')
 if ($m.Success) { $created = [int]$m.Groups[1].Value }
 
 Write-Result "✅ 创建成功: $created/$BatchCount"
