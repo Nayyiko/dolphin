@@ -128,8 +128,8 @@ def bench_schedule(mc: MetricsClient, count: int = 100, wait_minutes: int = 3):
     section(f"调度链路压测 (创建 {count} 个任务, 等待 {wait_minutes} 分钟自然触发)")
 
     # 1. 记录基线
-    sched_before = mc.histogram(SCHED_METRICS, "dolphin_scheduler_task_lag_seconds")
-    worker_before = mc.histogram(WORKER_METRICS, "dolphin_worker_task_duration_seconds")
+    sched_before = mc.histogram("scheduler", "dolphin_scheduler_task_lag_seconds")
+    worker_before = mc.histogram("worker", "dolphin_worker_task_duration_seconds")
     completed_before = mc._parse_simple(mc.fetch("worker"), "dolphin_worker_task_completed_total")
     dispatch_before = mc._parse_simple(mc.fetch("scheduler"), "dolphin_scheduler_dispatch_total")
     log(f"  基线: dispatch={int(dispatch_before)}, 调度样本={int(sched_before['count'])}, "
@@ -156,21 +156,21 @@ def bench_schedule(mc: MetricsClient, count: int = 100, wait_minutes: int = 3):
     deadline = time.time() + wait_minutes * 60
     while time.time() < deadline:
         time.sleep(10)
-        sched_now = mc.histogram(SCHED_METRICS, "dolphin_scheduler_task_lag_seconds")
+        sched_now = mc.histogram("scheduler", "dolphin_scheduler_task_lag_seconds")
         new_samples = sched_now["count"] - sched_before["count"]
         if new_samples >= count * 0.9:
             log(f"  已采集到 {int(new_samples)} 个调度样本")
             break
     else:
-        sched_now = mc.histogram(SCHED_METRICS, "dolphin_scheduler_task_lag_seconds")
+        sched_now = mc.histogram("scheduler", "dolphin_scheduler_task_lag_seconds")
 
     # 4. 再等执行完成
     log("▶ 等待执行完成上报 (30s)...")
     time.sleep(30)
 
     # 5. 采集最终指标
-    sched_after = mc.histogram(SCHED_METRICS, "dolphin_scheduler_task_lag_seconds")
-    worker_after = mc.histogram(WORKER_METRICS, "dolphin_worker_task_duration_seconds")
+    sched_after = mc.histogram("scheduler", "dolphin_scheduler_task_lag_seconds")
+    worker_after = mc.histogram("worker", "dolphin_worker_task_duration_seconds")
     completed_after = mc._parse_simple(mc.fetch("worker"), "dolphin_worker_task_completed_total")
     dispatch_after = mc._parse_simple(mc.fetch("scheduler"), "dolphin_scheduler_dispatch_total")
 
@@ -190,7 +190,7 @@ def bench_schedule(mc: MetricsClient, count: int = 100, wait_minutes: int = 3):
         lag_avg = lag_sum / lag_samples
         log(f"    调度延迟均值: {lag_avg*1000:.1f} ms")
         # 用 histogram buckets 估算 P99
-        h_pct = mc.histogram_percentiles(SCHED_METRICS, "dolphin_scheduler_task_lag_seconds")
+        h_pct = mc.histogram_percentiles("scheduler", "dolphin_scheduler_task_lag_seconds")
         log(f"    调度延迟 P50/P95/P99: {h_pct['p50']} / {h_pct['p95']} / {h_pct['p99']} ms"
             if h_pct.get("p99") else f"    调度延迟 P99: 样本不足")
         report_data["schedule_lag"] = {"count": lag_samples, "avg_ms": round(lag_avg*1000, 1),
@@ -202,7 +202,7 @@ def bench_schedule(mc: MetricsClient, count: int = 100, wait_minutes: int = 3):
     if dur_samples >= 10:
         dur_avg = dur_sum / dur_samples
         log(f"    执行耗时均值: {dur_avg*1000:.1f} ms")
-        dur_pct = mc.histogram_percentiles(WORKER_METRICS, "dolphin_worker_task_duration_seconds",
+        dur_pct = mc.histogram_percentiles("worker", "dolphin_worker_task_duration_seconds",
                                            labels={"handler_type": "http"})
         log(f"    执行耗时 P50/P95/P99: {dur_pct['p50']} / {dur_pct['p95']} / {dur_pct['p99']} ms")
         report_data["exec_duration"] = {"count": dur_samples, "avg_ms": round(dur_avg*1000, 1),
