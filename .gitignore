@@ -30,3 +30,7 @@ vendor/
 
 # Docker
 .docker/
+
+# Python
+__pycache__/
+*.pyc
