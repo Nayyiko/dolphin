@@ -31,7 +31,7 @@
 
 | 组件 | 技术 |
 |------|------|
-| 语言 | Go 1.22+ |
+| 语言 | Go 1.26+ |
 | 选主 | etcd (Lease + Campaign) |
 | 持久化 | MySQL 8 + GORM |
 | 限流 | Redis Lua 令牌桶 |

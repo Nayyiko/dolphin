@@ -2,7 +2,7 @@
 # 多阶段构建：调度器镜像
 # ============================================================
 
-FROM golang:1.22-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 RUN apk add --no-cache git ca-certificates
 
