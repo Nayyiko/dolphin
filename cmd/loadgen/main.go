@@ -16,7 +16,9 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -38,6 +40,8 @@ func main() {
 		duration    time.Duration
 		qps         int
 		timeout     time.Duration
+		histogram   string // -histogram <metric>: 从 /metrics 读直方图算 P50/P95/P99
+		labelFilter string // -label 'k=v': 直方图 label 过滤
 	)
 
 	flag.StringVar(&url, "url", "http://localhost:8080/health", "target URL")
@@ -47,7 +51,18 @@ func main() {
 	flag.DurationVar(&duration, "duration", 10*time.Second, "test duration")
 	flag.IntVar(&qps, "qps", 0, "limit QPS (0 = unlimited)")
 	flag.DurationVar(&timeout, "timeout", 5*time.Second, "per-request timeout")
+	flag.StringVar(&histogram, "histogram", "", "read histogram metric from /metrics and compute percentiles")
+	flag.StringVar(&labelFilter, "label", "", "label filter for histogram, e.g. handler_type=http")
 	flag.Parse()
+
+	if histogram != "" {
+		// 直方图模式：url 是 metrics 端点
+		if err := readHistogram(url, histogram, labelFilter); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if url == "" {
 		fmt.Println("error: -url is required")
@@ -232,4 +247,134 @@ func doRequest(client *http.Client, method, url, body string) (*http.Response, e
 		req.Header.Set("Content-Type", "application/json")
 	}
 	return client.Do(req)
+}
+
+// readHistogram 从 Prometheus /metrics 端点读取直方图指标，计算 P50/P95/P99/均值。
+// url 是 metrics 端点，metric 是直方图指标名（不含 _bucket/_count/_sum）。
+// label 是可选的过滤条件，形如 "handler_type=http"。
+func readHistogram(url, metric, label string) error {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return fmt.Errorf("fetch metrics: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read body: %w", err)
+	}
+
+	text := string(body)
+	lines := strings.Split(text, "\n")
+
+	// 解析 buckets: metric_bucket{...} value
+	type bucket struct {
+		le    float64
+		count float64
+	}
+	var buckets []bucket
+	var totalCount float64
+	var totalSum float64
+
+	for _, line := range lines {
+		if label != "" && !labelMatch(line, label) {
+			continue
+		}
+		if strings.HasPrefix(line, metric+"_bucket") {
+			// 提取 le="..." 和值
+			if leMatch := regexp.MustCompile(`le="([^"]+)"`).FindStringSubmatch(line); leMatch != nil {
+				var le float64
+				if leMatch[1] == "+Inf" {
+					le = math.Inf(1)
+				} else if v, err := strconv.ParseFloat(leMatch[1], 64); err == nil {
+					le = v
+				} else {
+					continue
+				}
+				val := parseLastFloat(line)
+				buckets = append(buckets, bucket{le: le, count: val})
+			}
+		} else if strings.HasPrefix(line, metric+"_count") && !strings.HasPrefix(line, metric+"_count_") {
+			totalCount = parseLastFloat(line)
+		} else if strings.HasPrefix(line, metric+"_sum") {
+			totalSum = parseLastFloat(line)
+		}
+	}
+
+	if len(buckets) == 0 {
+		return fmt.Errorf("no buckets found for metric %s (label=%s), check /metrics endpoint", metric, label)
+	}
+
+	// 排序 buckets by le
+	sort.Slice(buckets, func(i, j int) bool { return buckets[i].le < buckets[j].le })
+
+	// 百分位估算（线性插值）
+	pct := func(p float64) float64 {
+		target := totalCount * p
+		prevLE, prevCum := 0.0, 0.0
+		for _, b := range buckets {
+			if math.IsInf(b.le, 1) {
+				return prevLE
+			}
+			if b.count >= target {
+				if b.count <= prevCum {
+					return b.le
+				}
+				ratio := (target - prevCum) / (b.count - prevCum)
+				return prevLE + (b.le - prevLE) * ratio
+			}
+			prevLE, prevCum = b.le, b.count
+		}
+		return prevLE
+	}
+
+	avg := 0.0
+	if totalCount > 0 {
+		avg = totalSum / totalCount
+	}
+
+	fmt.Println()
+	fmt.Println("══════════════ 直方图统计 ══════════════")
+	fmt.Printf("指标:       %s\n", metric)
+	if label != "" {
+		fmt.Printf("标签过滤:   %s\n", label)
+	}
+	fmt.Printf("样本数:     %d\n", int(totalCount))
+	if totalCount >= 10 {
+		fmt.Printf("均值:       %.3f s (%.1f ms)\n", avg, avg*1000)
+		fmt.Printf("P50:        %.3f s (%.1f ms)\n", pct(0.50), pct(0.50)*1000)
+		fmt.Printf("P95:        %.3f s (%.1f ms)\n", pct(0.95), pct(0.95)*1000)
+		fmt.Printf("P99:        %.3f s (%.1f ms)\n", pct(0.99), pct(0.99)*1000)
+	} else {
+		fmt.Printf("样本数不足 (<10)，无法给出可信百分位\n")
+	}
+	fmt.Println("══════════════════════════════════════")
+	return nil
+}
+
+// parseLastFloat 提取行末尾的数值。
+func parseLastFloat(line string) float64 {
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return 0
+	}
+	v, err := strconv.ParseFloat(fields[len(fields)-1], 64)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
+// labelMatch 检查行是否匹配 label 条件。
+// 支持 "key=value" 和 "key=\"value\"" 两种形式。
+func labelMatch(line, label string) bool {
+	key, val, found := strings.Cut(label, "=")
+	if !found {
+		return strings.Contains(line, label)
+	}
+	// 匹配 key="value" 或 key=value
+	if strings.Contains(line, key+"=\""+val+"\"") {
+		return true
+	}
+	return strings.Contains(line, key+"="+val)
 }
