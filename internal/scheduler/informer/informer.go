@@ -21,6 +21,9 @@ type TaskLister interface {
 	List() []*TaskItem
 	ListByStatus(status string) []*TaskItem
 	Get(taskID string) (*TaskItem, bool)
+	// UpdateNextRunAt 直接更新本地缓存中的 next_run_at。
+	// 用于 Reconciler 下发后同步缓存，避免 Informer 轮询延迟导致重复调度。
+	UpdateNextRunAt(taskID string, t time.Time)
 }
 
 // Store 任务本地缓存存储。
@@ -72,6 +75,17 @@ func (s *Store) Delete(taskID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.items, taskID)
+}
+
+// UpdateNextRunAt 直接更新本地缓存中任务的 next_run_at。
+// 避免 Reconciler dispatch 后 Informer 下一个轮询周期前，
+// 到期扫描器仍看到旧的过期时间导致重复调度。
+func (s *Store) UpdateNextRunAt(taskID string, t time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if it, ok := s.items[taskID]; ok {
+		it.Task.NextRunAt = t
+	}
 }
 
 // EventType 变更事件类型。

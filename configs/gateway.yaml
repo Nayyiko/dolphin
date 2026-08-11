@@ -15,5 +15,10 @@ rate_limit:
   default_rate: 100
   default_capacity: 200
   window_seconds: 60
+circuit_breaker:
+  failure_threshold: 5
+  timeout: 30s
+  half_open_max: 3
+  enabled: true
 scheduler:
   addr: localhost:50051

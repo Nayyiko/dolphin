@@ -25,6 +25,12 @@ type GatewayConfig struct {
 		DefaultCap     int   `yaml:"default_capacity"` // burst
 		WindowSeconds  int64 `yaml:"window_seconds"`  // key 过期窗口
 	} `yaml:"rate_limit"`
+	CircuitBreaker struct {
+		Enabled          bool          `yaml:"enabled"`
+		FailureThreshold int           `yaml:"failure_threshold"`
+		Timeout          time.Duration `yaml:"timeout"`
+		HalfOpenMax      int           `yaml:"half_open_max"`
+	} `yaml:"circuit_breaker"`
 	Scheduler struct {
 		Addr string `yaml:"addr"` // gRPC 地址
 	} `yaml:"scheduler"`
@@ -68,6 +74,10 @@ type WorkerConfig struct {
 	Scheduler struct {
 		Addr string `yaml:"addr"`
 	} `yaml:"scheduler"`
+	Etcd struct {
+		Endpoints   []string      `yaml:"endpoints"`
+		DialTimeout time.Duration `yaml:"dial_timeout"`
+	} `yaml:"etcd"`
 	Pool struct {
 		Capacity int `yaml:"capacity"`
 	} `yaml:"pool"`

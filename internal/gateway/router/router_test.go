@@ -168,6 +168,62 @@ func TestRouter_ServeHTTPFull(t *testing.T) {
 	}
 }
 
+// TestRouter_StatusWriterCapture 验证直接写底层 Writer 的组件（如反向代理）
+// 产生的状态码能被 Context.Status 捕获，供 Metrics / 熔断器读取。
+// 这是熔断器能正确感知上游 5xx 的前提。
+func TestRouter_StatusWriterCapture(t *testing.T) {
+	var capturedStatus int
+
+	r := NewRouter()
+	// 中间件：在 handler 执行后读取捕获到的状态码（等价于 CircuitBreakerMiddleware 的判定逻辑）
+	r.Use(func(next HandlerFunc) HandlerFunc {
+		return func(c *Context) {
+			next(c)
+			capturedStatus = c.Status
+		}
+	})
+
+	// handler 模拟反向代理：直接写 http.Error 到 c.Writer，不经过 c.JSON/c.String
+	r.GET("/proxy/*rest", func(c *Context) {
+		http.Error(c.Writer, "Bad Gateway: upstream refused", http.StatusBadGateway)
+	})
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/proxy/upstream", nil)
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadGateway {
+		t.Errorf("response code: got %d, want %d", rr.Code, http.StatusBadGateway)
+	}
+	if capturedStatus != http.StatusBadGateway {
+		t.Errorf("captured status: got %d, want %d (statusWriter must intercept direct writes)",
+			capturedStatus, http.StatusBadGateway)
+	}
+}
+
+// TestRouter_StatusWriterFlush 验证 statusWriter 透传 Flush，反向代理流式响应可用。
+func TestRouter_StatusWriterFlush(t *testing.T) {
+	r := NewRouter()
+	r.GET("/stream", func(c *Context) {
+		// 直接写并 Flush，模拟 SSE / 流式代理
+		_, _ = c.Writer.Write([]byte("chunk"))
+		if f, ok := c.Writer.(http.Flusher); ok {
+			f.Flush()
+		}
+	})
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/stream", nil)
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("stream: got %d, want %d", rr.Code, http.StatusOK)
+	}
+	if rr.Body.String() != "chunk" {
+		t.Errorf("stream body: got %q, want %q", rr.Body.String(), "chunk")
+	}
+}
+
 func BenchmarkRouter_StaticMatch(b *testing.B) {
 	r := NewRouter()
 	r.GET("/api/v1/tasks", func(c *Context) { c.String(200, "ok") })

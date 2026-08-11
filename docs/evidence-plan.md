@@ -56,6 +56,12 @@
 - 数据：恢复时间 ≈ 心跳超时（默认 30s）+ 检测周期
 - **面试讲**："Worker 心跳超时后，Reconciler 发现它名下的 running 任务，重新分配。恢复时间由心跳超时控制。"
 
+**证据 3a+：Leader 切换后 Worker 自动跟随（架构补齐）**
+- 背景：早期版本 Worker 把 Scheduler 地址写死在配置里。Leader 从 50051 切到 50052 后，Worker 无法发现新 Leader，故障转移链断掉。
+- 修复：Leader 当选后把 gRPC 地址写入 etcd（`/dolphin/scheduler/leader-addr`，绑定选主 Lease，Leader 死亡自动过期）；Worker 监听该 key，变化即切换连接。
+- 数据：Leader kill 后，Worker 通过 etcd watch 在秒级发现新地址并自动重连，无需重启。
+- **面试讲**："Worker 和 kubelet 一样，不硬编码 apiserver 地址，而是通过 etcd 发现当前 Leader。Leader 切换后 Worker 自动跟随，故障转移才是完整闭环。"
+
 **证据 3b：不重复执行（幂等）**
 - 实验：kill Worker 后观察 TaskLog，确认没有同一个 instance_id 执行两次
 - 数据：每个 instance_id 只有一条执行记录
@@ -81,14 +87,15 @@
 
 | 创新点 | 数据 | 状态 | 怎么补 |
 |--------|------|------|--------|
-| 1 | 调度延迟 P50/P99 | 已有（3 样本弱） | 建 100 任务等自然触发，读直方图 |
+| 1 | 调度延迟 P50/P99 | ✅ 已有（58 样本：P50 1.37s / P95 1.94s / P99 2s） | — |
 | 1 | 创建吞吐 | ✅ 已有 58/s | — |
-| 2 | Leader 故障转移 | ❌ 缺 | 起 2 scheduler，kill leader |
-| 3 | Worker 故障转移 | ❌ 缺 | 起 2 worker，kill 一个 |
-| 3 | 幂等验证 | ❌ 缺 | 观察 TaskLog 无重复 instance_id |
+| 2 | Leader 故障转移 | ✅ 已有（1.22s 接管） | 复跑确认 |
+| 3 | Worker 故障转移 | ✅ 代码就绪，待复跑 | `failover_test.ps1`（已修复 */1 cron + Worker 发现跟随） |
+| 3 | 幂等验证 | ✅ 代码就绪，待复跑 | 观察 TaskLog 无重复 instance_id |
+| 3 | Worker 自动跟随 Leader | ✅ 代码就绪（etcd 发现机制） | kill Leader 后观察 Worker 自动切到新端口 |
 | 4 | 精确限流 | ✅ 已有（vegeta 429 数据） | — |
 | 4 | 多实例共享 | ❌ 缺 | 起 2 gateway |
-| — | 裸网关吞吐 | ✅ 已有（2093 QPS） | 但需重新交叉验证 |
+| — | 裸网关吞吐 | ✅ 已有（2093 QPS） | 需重新交叉验证 |
 
 ---
 
@@ -113,7 +120,7 @@
 > "调度器高可用我用了 etcd 选主。关键不是'拿到锁'，而是'旧 Leader 失去锁后写入也被拒绝'。etcd 的 Lease 过期后，旧 Leader 的 Put 会返回 ErrLeaseNotFound——这是 Redis 锁做不到的，也是我选 etcd 的原因。实测 kill 掉 Leader，另一个 TTL 后接管。"
 
 ### 创新点 3（不丢不重）
-> "Worker 执行到一半挂了，任务不能丢也不能重。我用了幂等 instance_id——每次执行一个唯一 ID，重试生成新 ID，旧实例即使残留也不会被误判为成功。心跳超时后 Reconciler 重新分配任务，恢复时间由心跳超时控制。实测 kill 掉 Worker，任务 X 秒后在另一个 Worker 上恢复。"
+> "Worker 执行到一半挂了，任务不能丢也不能重。我用了幂等 instance_id——每次执行一个唯一 ID，重试生成新 ID，旧实例即使残留也不会被误判为成功。心跳超时后 Reconciler 重新分配任务，恢复时间由心跳超时控制。实测 kill 掉 Worker，任务 X 秒后在另一个 Worker 上恢复。另外一个细节：早期 Worker 把 Scheduler 地址写死，Leader 切换后连不上新主。我补了 etcd 发现机制——Leader 把地址写到 etcd，Worker watch 到变化自动切换，这才让故障转移闭环成立。"
 
 ### 创新点 4（分布式限流）
 > "多网关实例要共享限流状态，我用 Redis 令牌桶，Lua 脚本保证原子性。vegeta 打 1000 QPS、rate=100，实测 15000 请求里 13300 个 429，精确对应超限部分——证明令牌桶算法正确。而且限流状态在 Redis，多个实例共享同一个桶，不会出现'各限各的导致总量翻倍'。"
@@ -124,8 +131,8 @@
 
 | 创新点 | 核心数据 | 一句话佐证 |
 |--------|---------|-----------|
-| 控制器模式 | 调度延迟 P50 ~1s | 事件驱动替代定时扫库，延迟来源清晰 |
-| 选主防脑裂 | Leader 接管 ~TTL | etcd Lease 机制杜绝双主 |
-| 不丢不重 | Worker 恢复 ~心跳超时 | 幂等 instance_id 保证不重复 |
+| 控制器模式 | 调度延迟 P50 ~1.4s / P99 ~2s | 事件驱动替代定时扫库，延迟来源清晰 |
+| 选主防脑裂 | Leader 接管 1.22s | etcd Lease 机制杜绝双主 |
+| 不丢不重 | Worker 恢复 ~心跳超时 + 自动跟随新 Leader | 幂等 instance_id 保证不重复 |
 | 分布式限流 | 429 精确匹配超限 | Redis Lua 原子令牌桶，多实例共享 |
 | 网关能力 | 裸吞吐 ~2000 QPS, P99 <10ms | 路由/中间件层性能 |

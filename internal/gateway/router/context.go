@@ -12,6 +12,38 @@ type HandlerFunc func(*Context)
 // Middleware 中间件签名。接收一个 handler，返回包装后的 handler（洋葱模型）。
 type Middleware func(HandlerFunc) HandlerFunc
 
+// statusWriter 包装 http.ResponseWriter，捕获真实写出的状态码。
+// 反向代理等组件直接写 c.Writer（不走 c.JSON/c.String），
+// 若不捕获，Metrics 和熔断器永远看到 200。
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+	ctx    *Context
+}
+
+// WriteHeader 记录状态码并透传。
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ctx.Status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// Write 在未显式 WriteHeader 时默认记录 200。
+func (w *statusWriter) Write(b []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+		w.ctx.Status = http.StatusOK
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+// Flush 透传，保证反向代理的流式响应可用。
+func (w *statusWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // Context 请求上下文，贯穿整个请求生命周期。
 // 采用对象池复用，减少 GC 压力。
 type Context struct {

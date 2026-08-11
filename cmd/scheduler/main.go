@@ -146,6 +146,22 @@ func main() {
 	leaderElector.SetOnBecomeLeader(func(ctx context.Context) {
 		slog.Info("starting reconciler as leader")
 		go recon.Run(ctx)
+		go recon.RunDueTaskScanner(ctx, time.Second)
+		// Worker 心跳超时检测 + 故障转移。检测周期 = 心跳间隔，容忍阈值 = failover.heartbeat_timeout
+		heartbeatTimeout := cfg.Failover.HeartbeatTimeout
+		if heartbeatTimeout <= 0 {
+			heartbeatTimeout = 30 * time.Second
+		}
+		go recon.RunWorkerMonitor(ctx, heartbeatTimeout, 5*time.Second)
+
+		// 将本实例的 gRPC 地址发布到 etcd，并绑定到选主 lease。
+		// Worker 监听该 key，Leader 切换后自动连到新地址（发现机制）。
+		grpcAddr := fmt.Sprintf("localhost:%d", cfg.Server.GRPCPort)
+		if err := leaderElector.Publish(ctx, election.LeaderAddrKey, grpcAddr); err != nil {
+			slog.Warn("publish leader addr failed", "err", err)
+		} else {
+			slog.Info("published leader addr", "key", election.LeaderAddrKey, "addr", grpcAddr)
+		}
 	})
 	leaderElector.SetOnLoseLeader(func() {
 		slog.Warn("lost leadership")

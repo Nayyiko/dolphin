@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/yourname/dolphin/internal/gateway/router"
+	"github.com/yourname/dolphin/internal/pkg/metrics"
 )
 
 // ErrCircuitOpen 熔断器打开，请求被拒绝。
@@ -52,6 +53,7 @@ type CircuitBreaker struct {
 	halfOpenCount    int    // 半开期间已允许的探测数
 	halfOpenSuccess  int    // 半开期间已成功的探测数
 	lastFailureAt    time.Time
+	backend          string // 被保护的上游标识，用于指标 label
 
 	mu sync.RWMutex
 }
@@ -82,6 +84,23 @@ func NewCircuitBreaker(cfg CircuitBreakerConfig) *CircuitBreaker {
 	}
 }
 
+// SetBackend 记录被保护的上游标识，用于 Prometheus label。
+func (cb *CircuitBreaker) SetBackend(backend string) {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.backend = backend
+	cb.reportState() // 初始状态 Closed 立即上报，gauge 才有值
+}
+
+// reportState 将当前状态刷新到 Prometheus gauge。
+// 仅当 backend 已设置时才上报（未接线时不产生指标）。
+func (cb *CircuitBreaker) reportState() {
+	if cb.backend == "" {
+		return
+	}
+	metrics.GatewayCircuitBreakerState.WithLabelValues(cb.backend).Set(float64(cb.state))
+}
+
 // State 返回当前状态（线程安全）。
 func (cb *CircuitBreaker) State() State {
 	cb.mu.RLock()
@@ -101,6 +120,7 @@ func (cb *CircuitBreaker) Allow() bool {
 			cb.state = StateHalfOpen
 			cb.halfOpenCount = 0
 			cb.halfOpenSuccess = 0
+			cb.reportState()
 			return true
 		}
 		return false
@@ -129,6 +149,7 @@ func (cb *CircuitBreaker) Report(success bool) {
 				cb.state = StateClosed
 				cb.halfOpenCount = 0
 				cb.halfOpenSuccess = 0
+				cb.reportState()
 			}
 		}
 		return
@@ -141,12 +162,14 @@ func (cb *CircuitBreaker) Report(success bool) {
 	case StateClosed:
 		if cb.failureCount >= cb.failureThreshold {
 			cb.state = StateOpen
+			cb.reportState()
 		}
 	case StateHalfOpen:
 		// 半开探测失败 → 立即回退到 Open
 		cb.state = StateOpen
 		cb.halfOpenCount = 0
 		cb.halfOpenSuccess = 0
+		cb.reportState()
 	}
 }
 

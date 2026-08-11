@@ -96,6 +96,13 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	c := acquireContext(w, req, []HandlerFunc{handler})
 	c.Params = params
+	// 用 statusWriter 包裹原始 writer，反向代理等直接写 writer 的组件
+	// 也能被捕获到真实状态码（否则 Metrics/熔断器永远看到 200）。
+	if sw, ok := w.(*statusWriter); ok {
+		c.Writer = sw
+	} else {
+		c.Writer = &statusWriter{ResponseWriter: w, ctx: c}
+	}
 	c.Next()
 	releaseContext(c)
 }

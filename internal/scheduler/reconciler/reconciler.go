@@ -104,6 +104,130 @@ func (r *Reconciler) Run(ctx context.Context) {
 	wg.Wait()
 }
 
+// RunDueTaskScanner 定期扫描到期任务并入队。
+// cron 调度自动触发的核心机制：扫描 next_run_at <= now 的任务，推入 WorkQueue。
+// 仅在 Leader 节点运行，interval 建议 1s。
+func (r *Reconciler) RunDueTaskScanner(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			tasks, err := r.manager.ListDueTasks(ctx, time.Now())
+			if err != nil {
+				slog.Warn("due task scan failed", "err", err)
+				continue
+			}
+			for i := range tasks {
+				r.EnqueueTask(tasks[i].ID)
+			}
+			if len(tasks) > 0 {
+				slog.Debug("due task scanner enqueued", "count", len(tasks))
+			}
+		}
+	}
+}
+
+// RunWorkerMonitor 定期检测心跳超时的 Worker，触发故障转移。
+// 仅 Leader 运行。心跳超时后:
+//  1. 标记 Worker offline（DB + 内存 registry）
+//  2. 释放该 Worker 上所有 running 的 TaskLog（置为 failed，带错误信息）
+//  3. 将相关任务的 next_run_at 置为 now，立即重新调度到其他 Worker
+//
+// 这实现了"任务不丢不重"：Worker 挂了任务自动转移，且不重复执行。
+func (r *Reconciler) RunWorkerMonitor(ctx context.Context, heartbeatTimeout time.Duration, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := r.checkWorkerHeartbeats(ctx, heartbeatTimeout); err != nil {
+				slog.Warn("worker heartbeat check failed", "err", err)
+			}
+		}
+	}
+}
+
+// checkWorkerHeartbeats 检测心跳超时并执行故障转移。
+func (r *Reconciler) checkWorkerHeartbeats(ctx context.Context, timeout time.Duration) error {
+	deadline := time.Now().Add(-timeout)
+
+	var stale []model.Worker
+	if err := r.db.WithContext(ctx).
+		Where("status = ? AND last_heartbeat < ?", model.WorkerStatusOnline, deadline).
+		Find(&stale).Error; err != nil {
+		return err
+	}
+	if len(stale) == 0 {
+		return nil
+	}
+
+	for i := range stale {
+		w := stale[i]
+		slog.Warn("worker heartbeat timeout, failing over",
+			"worker_id", w.ID, "last_heartbeat", w.LastHeartbeat, "timeout", timeout)
+
+		// 1. 标记离线
+		if err := r.db.WithContext(ctx).Model(&model.Worker{}).
+			Where("id = ?", w.ID).Update("status", model.WorkerStatusOffline).Error; err != nil {
+			slog.Warn("mark worker offline failed", "worker_id", w.ID, "err", err)
+			continue
+		}
+
+		// 2. 释放该 worker 上所有 running 任务（置 failed）
+		now := time.Now()
+		var runningLogs []model.TaskLog
+		if err := r.db.WithContext(ctx).
+			Where("worker_id = ? AND status = ?", w.ID, model.TaskLogStatusRunning).
+			Find(&runningLogs).Error; err != nil {
+			slog.Warn("query running logs failed", "worker_id", w.ID, "err", err)
+			continue
+		}
+
+		failedTaskIDs := make([]string, 0, len(runningLogs))
+		for j := range runningLogs {
+			l := runningLogs[j]
+			errMsg := "worker heartbeat timeout, task re-scheduled"
+			if err := r.db.WithContext(ctx).Model(&l).Updates(map[string]any{
+				"status":    model.TaskLogStatusFailed,
+				"end_time":  &now,
+				"error_msg": errMsg,
+			}).Error; err != nil {
+				slog.Warn("fail running log failed", "instance_id", l.InstanceID, "err", err)
+				continue
+			}
+			failedTaskIDs = append(failedTaskIDs, l.TaskID)
+		}
+		slog.Info("worker failover: released running tasks",
+			"worker_id", w.ID, "released", len(failedTaskIDs))
+
+		// 3. 将受影响任务的 next_run_at 置为 now，触发立即重新调度
+		//    去重，避免同一任务多次更新
+		seen := make(map[string]bool)
+		for _, tid := range failedTaskIDs {
+			if seen[tid] {
+				continue
+			}
+			seen[tid] = true
+			if err := r.manager.UpdateNextRunAt(ctx, tid, time.Now()); err != nil {
+				slog.Warn("reset next_run_at failed", "task_id", tid, "err", err)
+				continue
+			}
+			// 同步更新本地缓存，让 scanner/事件处理立即看到
+			r.lister.UpdateNextRunAt(tid, time.Now())
+			// 直接入队，立即重新调度
+			r.EnqueueTask(tid)
+		}
+
+			slog.Info("worker failover complete", "worker_id", w.ID, "tasks_requeued", len(seen))
+	}
+	return nil
+}
+
 func (r *Reconciler) worker(ctx context.Context) {
 	for {
 		key, shutdown := r.queue.Get()
@@ -211,7 +335,7 @@ func (r *Reconciler) dispatch(ctx context.Context, task *model.Task) error {
 	if lag < 0 {
 		lag = 0 // 手动触发时 next_run_at 可能被设为过去，取 0
 	}
-	metrics.RecordDispatch(task.ID, result.WorkerID, lag, true)
+	metrics.RecordDispatch(task.HandlerType, lag, true)
 
 	// 记录执行日志
 	instanceID := result.InstanceID
@@ -240,6 +364,9 @@ func (r *Reconciler) dispatch(ctx context.Context, task *model.Task) error {
 			if err := r.manager.UpdateNextRunAt(ctx, task.ID, next); err != nil {
 				return err
 			}
+			// 同步更新本地缓存：避免 scanner 在 Informer 下一轮刷新前
+			// 仍看到旧的 next_run_at，导致同一 cron 周期重复调度。
+			r.lister.UpdateNextRunAt(task.ID, next)
 		}
 	}
 

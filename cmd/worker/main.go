@@ -15,7 +15,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/yourname/dolphin/internal/pkg/config"
+	"github.com/yourname/dolphin/internal/pkg/etcdutil"
+	"github.com/yourname/dolphin/internal/scheduler/election"
 	"github.com/yourname/dolphin/internal/worker/client"
+	"github.com/yourname/dolphin/internal/worker/discovery"
 	"github.com/yourname/dolphin/internal/worker/executor"
 )
 
@@ -68,6 +71,28 @@ func main() {
 	// 运行客户端（注册 + 心跳 + 收任务）——阻塞直到 ctx 取消
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// ── Leader 自动发现 ──
+	// Worker 启动时可能早于 Scheduler Leader 就绪；etcd 是系统核心依赖，若不可用
+	// 则回退到静态配置地址（保持向后兼容），不阻塞 Worker 启动。
+	if len(cfg.Etcd.Endpoints) > 0 {
+		etcdCli, err := etcdutil.NewClient(cfg.Etcd.Endpoints, cfg.Etcd.DialTimeout)
+		if err != nil {
+			slog.Warn("worker etcd unavailable, using static scheduler addr",
+				"addr", cfg.Scheduler.Addr, "err", err)
+		} else {
+			defer etcdCli.Close()
+			disc := discovery.New(etcdCli, election.LeaderAddrKey, func(_ context.Context, addr string) {
+				cl.UpdateAddr(addr)
+			})
+			go func() {
+				if err := disc.Run(ctx); err != nil && ctx.Err() == nil {
+					slog.Warn("leader discovery stopped", "err", err)
+				}
+			}()
+			slog.Info("leader discovery enabled", "etcd_key", election.LeaderAddrKey)
+		}
+	}
 
 	// metrics HTTP server
 	httpServer := &http.Server{

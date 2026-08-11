@@ -8,6 +8,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/yourname/dolphin/internal/gateway/router"
+	"github.com/yourname/dolphin/internal/pkg/metrics"
 )
 
 // tokenBucketLua 令牌桶限流脚本。
@@ -93,6 +94,8 @@ func RateLimit(rl *RateLimiter, clientIDKey string) router.Middleware {
 
 			allowed, _ := rl.Allow(c.Request.Context(), key)
 			if !allowed {
+				// 记录限流拒绝指标（按 client + endpoint）
+				metrics.GatewayRatelimitRejectedTotal.WithLabelValues(cid, c.Request.URL.Path).Inc()
 				c.JSON(http.StatusTooManyRequests, map[string]any{
 					"code":    "rate_limited",
 					"message": "too many requests",

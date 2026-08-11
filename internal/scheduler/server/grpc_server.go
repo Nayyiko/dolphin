@@ -80,6 +80,17 @@ func (s *SchedulerService) WorkersOnline() int {
 // Connect 处理 Worker 双向流。
 func (s *SchedulerService) Connect(stream pb.Scheduler_ConnectServer) error {
 	var wc *workerConn
+	defer func() {
+		// 连接断开：清理内存中的 worker 注册，避免把任务发给已断开的流
+		if wc != nil {
+			s.mu.Lock()
+			if cur, ok := s.workers[wc.id]; ok && cur == wc {
+				delete(s.workers, wc.id)
+			}
+			s.mu.Unlock()
+			slog.Warn("worker disconnected, removed from registry", "worker_id", wc.id)
+		}
+	}()
 
 	for {
 		in, err := stream.Recv()

@@ -1,5 +1,5 @@
 server:
-  metrics_port: 9091
+  metrics_port: 9093
 scheduler:
   addr: localhost:50051
 etcd:
@@ -7,6 +7,6 @@ etcd:
     - localhost:2379
   dial_timeout: 5s
 pool:
-  capacity: 50
+  capacity: 10
 heartbeat:
   interval: 10s

@@ -9,7 +9,13 @@ import (
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/concurrency"
+
+	"github.com/yourname/dolphin/internal/pkg/metrics"
 )
+
+// LeaderAddrKey 保存当前 Leader gRPC 地址的 etcd key。
+// Worker 监听此 key 实现 Leader 自动发现与切换。
+const LeaderAddrKey = "/dolphin/scheduler/leader-addr"
 
 // LeaderElector 基于 etcd Lease + Campaign 的 Leader 选举器。
 //
@@ -59,6 +65,17 @@ func (le *LeaderElector) IsLeader() bool {
 	return le.isLeader.Load()
 }
 
+// Publish 将 Leader 的 gRPC 服务地址写入 etcd，并绑定到选主 session 的 lease。
+// Leader 宕机 / 失去租约时，key 随 lease 自动过期删除；
+// Worker 通过监听该 key 发现并自动切换到新 Leader（故障转移的关键一环）。
+func (le *LeaderElector) Publish(ctx context.Context, key, value string) error {
+	if le.session == nil {
+		return fmt.Errorf("no session yet")
+	}
+	_, err := le.client.Put(ctx, key, value, clientv3.WithLease(le.session.Lease()))
+	return err
+}
+
 // Campaign 参与选举。阻塞直到成为 Leader 或 ctx 取消。
 func (le *LeaderElector) Campaign(ctx context.Context) error {
 	session, err := concurrency.NewSession(le.client,
@@ -81,6 +98,7 @@ func (le *LeaderElector) Campaign(ctx context.Context) error {
 
 	// 当选 Leader
 	le.isLeader.Store(true)
+	metrics.SchedulerLeaderElections.Inc()
 	slog.Info("became leader", "candidate", le.candidate)
 
 	// 监听 session 断开

@@ -91,13 +91,13 @@ var (
 		},
 	)
 
-	// 调度计数器
+	// 调度计数器（仅用 handler_type 聚合，避免 task_id 造成 label 基数爆炸）
 	SchedulerDispatchTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "dolphin_scheduler_dispatch_total",
 			Help: "Total number of tasks dispatched to workers.",
 		},
-		[]string{"task_id", "worker_id", "result"},
+		[]string{"handler_type", "result"},
 	)
 
 	// Leader 选举次数
@@ -225,12 +225,12 @@ func RecordAPIMetrics(method, path string, statusCode int, duration time.Duratio
 
 // RecordDispatch 调度器下发任务时记录调度计数和调度延迟。
 // lag = 任务到期(next_run_at)到实际下发的耗时。
-func RecordDispatch(taskID, workerID string, lag time.Duration, success bool) {
+func RecordDispatch(handlerType string, lag time.Duration, success bool) {
 	result := "success"
 	if !success {
 		result = "failed"
 	}
-	SchedulerDispatchTotal.WithLabelValues(taskID, workerID, result).Inc()
+	SchedulerDispatchTotal.WithLabelValues(handlerType, result).Inc()
 	SchedulerTaskLag.Observe(lag.Seconds())
 }
 
@@ -242,6 +242,12 @@ func RecordReconcile(d time.Duration) {
 // RecordMissedSchedule 漏调度计数。
 func RecordMissedSchedule() {
 	SchedulerMissedSchedules.Inc()
+}
+
+// RecordFailoverRecovery 记录故障转移恢复耗时。
+// 从 Worker 心跳超时检测到任务重新下发的时间。
+func RecordFailoverRecovery(d time.Duration) {
+	SchedulerFailoverRecoveryTime.Observe(d.Seconds())
 }
 
 // RecordWorkerTaskStarted worker 开始执行任务。

@@ -68,7 +68,21 @@ func main() {
 	}
 	rp := proxy.NewReverseProxy(upstreams, "rr")
 
-	// 示例业务路由（真实项目会注册任务管理 API）。
+	// 熔断器：保护反向代理上游。故障连续超过阈值→Open，冷却后→HalfOpen 探测。
+	// 未配置（阈值<=0）或未启用时，使用默认参数但不接中间件——保持纯观测。
+	cb := middleware.NewCircuitBreaker(middleware.CircuitBreakerConfig{
+		FailureThreshold: cfg.CircuitBreaker.FailureThreshold,
+		Timeout:          cfg.CircuitBreaker.Timeout,
+		HalfOpenMax:      cfg.CircuitBreaker.HalfOpenMax,
+	})
+	if cfg.CircuitBreaker.FailureThreshold <= 0 {
+		cb = middleware.NewCircuitBreaker(middleware.CircuitBreakerConfig{
+			FailureThreshold: 5, Timeout: 30 * time.Second, HalfOpenMax: 3,
+		})
+	}
+	cb.SetBackend("scheduler-proxy")
+
+	// 公共路由（无需认证）
 	r.GET("/health", func(c *router.Context) {
 		c.JSON(http.StatusOK, map[string]any{
 			"status":    "ok",
@@ -82,6 +96,15 @@ func main() {
 	r.GET("/", func(c *router.Context) {
 		c.String(http.StatusOK, "dolphin gateway\n")
 	})
+
+	// 受保护路由：需要 JWT + 熔断器保护的反向代理
+	// Auth 校验 Bearer token；CircuitBreaker 保护上游，连续失败快速失败
+	if cfg.JWT.Secret != "" {
+		r.Use(middleware.Auth(cfg.JWT.Secret))
+	}
+	if cfg.CircuitBreaker.Enabled {
+		r.Use(middleware.CircuitBreakerMiddleware(cb))
+	}
 	r.GET("/proxy/*rest", func(c *router.Context) {
 		rp.ServeHTTP(c.Writer, c.Request)
 	})
