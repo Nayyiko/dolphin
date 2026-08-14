@@ -60,9 +60,13 @@ Write-Host "在线 worker 数: $workers (期望 2)"
 
 # 确认哪个 scheduler 是 leader —— 多次采样，避免启动瞬间选举抖动/双主瞬态误判。
 function Get-IsLeader($port) {
+    # 只匹配"以指标名开头"的采样行。绝不能对整段内容做子串匹配——
+    # Prometheus 的 # HELP 行是 "# HELP dolphin_scheduler_is_leader 1 if this instance...",
+    # 子串 "dolphin_scheduler_is_leader 1" 会命中帮助行，导致 is_leader 永远报 True，
+    # 制造出"假双主/1s 接管"的幻觉。
     try {
         $m = (Invoke-WebRequest -Uri "http://localhost:$port/metrics" -UseBasicParsing -TimeoutSec 3).Content
-        return ($m -match "dolphin_scheduler_is_leader 1")
+        return [bool]((($m -split "`n") | Where-Object { $_ -match "^dolphin_scheduler_is_leader 1$" }))
     } catch { return $false }
 }
 
@@ -113,13 +117,14 @@ if ($leaderProc) {
     Stop-Process -Id $leaderProc.ProcessId -Force
     Write-Host "已 kill Leader"
 
-    # 轮询 follower 是否成为 leader
+    # 轮询 follower 是否成为 leader（行首锚定，避免 # HELP 行误报）
     $followerBecameLeader = $false
     for ($i = 0; $i -lt 40; $i++) {  # 最多 40s
         Start-Sleep 1
         try {
             $m = (Invoke-WebRequest -Uri "http://localhost:$followerPort/metrics" -UseBasicParsing -TimeoutSec 2).Content
-            if ($m -match "dolphin_scheduler_is_leader 1") {
+            $isLeaderNow = [bool]((($m -split "`n") | Where-Object { $_ -match "^dolphin_scheduler_is_leader 1$" }))
+            if ($isLeaderNow) {
                 $takeoverTime = Get-Date
                 $elapsed = ($takeoverTime - $killTime).TotalSeconds
                 Write-Host "✅ follower (端口 $followerPort) 已接管成为 Leader"
@@ -151,35 +156,56 @@ if ($leaderPort -eq 9090) { $followerGRPC = 50052 } else { $followerGRPC = 50051
 Write-Host "存活 scheduler 的 gRPC 端口: $followerGRPC"
 
 # Leader 切换后，等待 worker 通过 etcd 发现自动重连到新 leader（不重启）。
-# 轮询 workers 表直到 2 个 online（新 leader 的心跳续写会保持 online）。
-Write-Host "等待 worker 自动重连到新 leader..."
-$workersReady = $false
-for ($i = 0; $i -lt 30; $i++) {
-    Start-Sleep 1
-    $online = docker exec dolphin-mysql mysql -u root -pdolphin -N -e "SELECT COUNT(*) FROM dolphin.workers WHERE status='online';" 2>$null
-    if ($online -and [int]$online -ge 2) { Write-Host "  ✅ 2 个 worker 已 online（${i}s）"; $workersReady = $true; break }
+# 关键：不能看 MySQL workers 表——那是旧 leader 写入的残留状态（kill 后仍显示 online）。
+# 必须看新 leader 的「内存注册表 worker 数」指标（dolphin_scheduler_workers_online），
+# 只有它 > 0 才说明 worker 真正重连到了本实例、任务才能被下发。
+Write-Host "等待 worker 自动重连到新 leader（轮询内存注册表指标）..."
+function Get-WorkersOnline($port) {
+    try {
+        $m = (Invoke-WebRequest -Uri "http://localhost:$port/metrics" -UseBasicParsing -TimeoutSec 3).Content
+        $line = ($m -split "`n") | Where-Object { $_ -match "^dolphin_scheduler_workers_online " } | Select-Object -First 1
+        if ($line) { return [int](($line -split " ")[1]) }
+        return -1  # 指标还没暴露
+    } catch { return -1 }
 }
-if (-not $workersReady) { Write-Host "  ⚠️ ${i}s 内 worker 未全部 online，继续（可能影响调度）" }
+$workersReady = $false
+for ($i = 0; $i -lt 60; $i++) {  # 最多 120s（worker 重连有退避，最多 ~46s）
+    Start-Sleep 2
+    $online = Get-WorkersOnline $followerPort
+    if ($online -ge 1) { Write-Host "  ✅ $online 个 worker 已重连到新 leader（${i}x2s）"; $workersReady = $true; break }
+    if ($i % 10 -eq 0) { Write-Host "  ...等待中 (${i}x2s/120s), 内存注册表 worker=$online" }
+}
+if (-not $workersReady) { Write-Host "  ⚠️ 120s 内 worker 未重连到新 leader，继续（可能影响调度）" }
 
 # 创建 3 个每 1 分钟执行的任务（*/1 cron，60s 内必触发一次）。
 # handler 指向存活 scheduler 的 healthz，保证 Leader 故障转移后执行仍能成功。
-Write-Host "创建 3 个 */1 cron 任务..."
+# 创建后用 task trigger 立即触发（next_run_at=now），不必等 cron 整分钟，调度更快更确定。
+Write-Host "创建 3 个 */1 cron 任务并立即触发..."
 $batch = Get-Date -Format "HHmmss"
 for ($i = 1; $i -le 3; $i++) {
-    Ctl --addr "localhost:$followerGRPC" task create --name "failover-$batch-$i" --cron "*/1 * * * *" --handler "http://localhost:$followerPort/healthz" --timeout 5 --retries 1 2>&1 | Out-Null
+    $out = Ctl --addr "localhost:$followerGRPC" task create --name "failover-$batch-$i" --cron "*/1 * * * *" --handler "http://localhost:$followerPort/healthz" --timeout 5 --retries 1 2>&1
+    Write-Host "  create #$i -> $out"
+    $idLine = ($out | Select-String "id=").ToString()
+    if ($idLine) {
+        $id = ($idLine -split " " | Where-Object { $_ -match "^id=" }) -replace "id=",""
+        Ctl --addr "localhost:$followerGRPC" task trigger --id $id 2>&1 | Out-Null
+        Write-Host "  trigger #$i (id=$id)"
+    }
 }
-Write-Host "已创建 3 个任务 (batch=$batch, handler=localhost:$followerPort/healthz)"
+# 验证任务确实写入了 DB
+$taskCnt = docker exec dolphin-mysql mysql -u root -pdolphin -N -e "SELECT COUNT(*) FROM dolphin.tasks;" 2>$null
+Write-Host "DB 中任务数: $taskCnt (期望 3)"
 
-# 等待首轮调度（*/1 最多等 60s + 缓冲）
-Write-Host "等待首轮调度（最多 75s）..."
+# 等待首轮调度（trigger 后 Informer 1s 内入队，最多 30s 缓冲）
+Write-Host "等待首轮调度（最多 40s）..."
 $dispatched = $false
-for ($i = 0; $i -lt 15; $i++) {  # 15 * 5s = 75s
-    Start-Sleep 5
+for ($i = 0; $i -lt 20; $i++) {  # 20 * 2s = 40s
+    Start-Sleep 2
     $cnt = docker exec dolphin-mysql mysql -u root -pdolphin -N -e "SELECT COUNT(*) FROM dolphin.task_logs;" 2>$null
-    if ($cnt -and [int]$cnt -gt 0) { $dispatched = $true; Write-Host "  首轮调度完成，task_log=$cnt (${i}x5s)"; break }
-    if ($i % 3 -eq 0) { Write-Host "  ...等待中 ($($i*5)s/75s)" }
+    if ($cnt -and [int]$cnt -gt 0) { $dispatched = $true; Write-Host "  首轮调度完成，task_log=$cnt (${i}x2s)"; break }
+    if ($i % 5 -eq 0) { Write-Host "  ...等待中 ($($i*2)s/40s)" }
 }
-if (-not $dispatched) { Write-Host "❌ 75s 内任务未调度，中止测试"; exit 1 }
+if (-not $dispatched) { Write-Host "❌ 40s 内任务未调度，中止测试"; exit 1 }
 
 # 查看当前 task_log 分布在哪些 worker
 $logDump = docker exec dolphin-mysql mysql -u root -pdolphin -N -e "SELECT DISTINCT worker_id FROM dolphin.task_logs WHERE status='running' OR status='success' LIMIT 10;" 2>$null

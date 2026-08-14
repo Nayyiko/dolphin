@@ -116,6 +116,16 @@ var (
 		},
 	)
 
+	// 当前实例内存注册表中持有活跃流的在线 worker 数。
+	// 与 MySQL workers 表不同：这个值反映"本实例真正能下发任务的 worker"。
+	// 故障转移测试用它判断 Worker 是否已重连到新 Leader（MySQL online 只是残留状态）。
+	SchedulerWorkersOnline = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "dolphin_scheduler_workers_online",
+			Help: "Number of workers with an active gRPC stream registered in this instance's in-memory registry.",
+		},
+	)
+
 	// WorkQueue 深度
 	SchedulerQueueDepth = promauto.NewGauge(
 		prometheus.GaugeOpts{

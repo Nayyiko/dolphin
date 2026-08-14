@@ -226,6 +226,9 @@ func main() {
 				} else {
 					metrics.SchedulerIsLeader.Set(0)
 				}
+				// 内存注册表 worker 数：反映"本实例真正能下发任务的 worker"。
+				// 故障转移测试用它判断 worker 是否已重连到本实例。
+				metrics.SchedulerWorkersOnline.Set(float64(svc.WorkersOnline()))
 			}
 		}
 	}()
