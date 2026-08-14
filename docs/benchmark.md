@@ -164,6 +164,21 @@ loadgen -url http://localhost:8080/health -concurrency 50 -duration 10s
 loadgen -url http://localhost:8080/health -qps 1000 -duration 30s
 ```
 
+### E. DAG 依赖编排验证（hack/dag_test.ps1）
+
+一键验证三个可测行为，结果写入 `results/dag_test.txt`。
+
+| 验证项 | 方法 | 结果（2026-08-16 Windows 实机） |
+|--------|------|-------------------------------|
+| 环检测 | a→b 后让 a 依赖 b | 被拒，返回环路径 `[a b a]`，`dag_cycle_reject_total=1` |
+| 依赖门控 | a(sleep 4s)→b→c 同时触发 | a 执行期间 `dag_blocked_tasks=2`（b、c 被门控）；执行顺序 `a.end ≤ b.start ≤ c.start`，三任务全 success |
+| 事件驱动唤醒 | 测 b.start − a.end | **b=50ms、c=61ms**（<500ms，走事件推送而非 1s 扫描器兜底） |
+| 新鲜度语义 | 链式完成后单独触发 b | b 日志数 1→1 不变，保持阻塞 `dag_blocked_tasks=1`，不复用 a 的旧结果 |
+
+> `dag_gate_total=11` 说明：a 睡眠的 4s 内，1s due 扫描器每次发现 b/c 仍"到期未满足"就重入队、再门控一次（b、c 各 ~5 次 + 初始 trigger ≈ 11）。门控幂等可重入，正确性靠扫描器兜底、低延迟靠事件推送。
+
+运行前提：`docker compose up -d etcd mysql redis` → 重编译 scheduler/worker/dolphinctl（含 DAG 代码）→ `start-dev.ps1` 起 1 scheduler + 1 worker → `powershell -ExecutionPolicy Bypass -File hack\dag_test.ps1`。
+
 ---
 
 ## 三、需要实际跑出来的数据（面试汇报）
@@ -176,6 +191,7 @@ loadgen -url http://localhost:8080/health -qps 1000 -duration 30s
 | 4 | 故障恢复时间 | 证明 Failover SLO |
 | 5 | 一次完整冒烟测试输出 | 证明端到端链路 |
 | 6 | Worker 执行耗时 | 证明执行链路真实（如 39.7ms/次） |
+| 7 | DAG 环检测 + 事件驱动延迟 + 新鲜度 | 证明依赖编排三连（见上 E 节，实测 50/61ms） |
 
 跑完 `bench_full.ps1` 后，把 `results/bench-report.txt` 里的数字填进上文的表格，并更新 README 的压测章节。
 
@@ -203,4 +219,6 @@ loadgen -url http://localhost:8080/health -qps 1000 -duration 30s
 | `hack/bench_gateway.sh` | 网关 QPS/延迟压测（wrk/vegeta） |
 | `hack/bench_schedule.sh` | 调度吞吐/延迟压测（批量建任务） |
 | `hack/test_failover.sh` | 故障注入：kill Worker 测恢复时间 |
+| `hack/dag_test.ps1` | DAG 三连：环检测 + 链式/事件驱动延迟 + 新鲜度（Windows） |
+| `hack/schedule_concurrency_test.ps1` | 调度/执行并发：峰值并发执行 + 池利用率 + 执行延迟分布 + 分发速率（Windows） |
 | `cmd/dolphinctl` | 命令行工具：任务管理 + 批量建任务/触发 |
