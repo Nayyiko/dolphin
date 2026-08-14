@@ -146,7 +146,11 @@ func main() {
 				errCount.Add(1)
 			} else {
 				st = resp.StatusCode
-				_ = resp.Body.Close()
+				// 必须把响应体读完再关闭，transport 才能复用连接(keep-alive)。
+				// 否则每个请求都新建一条 TCP 连接：高并发下会耗尽 Windows
+				// 临时端口池(默认约 16k 个)导致大量连接错误，测不出真实吞吐。
+				_, _ = io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
 				if st >= 500 {
 					status5xx.Add(1)
 				}
