@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,7 +14,9 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/yourname/dolphin/api/proto/pb"
+	"github.com/yourname/dolphin/internal/pkg/metrics"
 	"github.com/yourname/dolphin/internal/pkg/model"
+	"github.com/yourname/dolphin/internal/scheduler/dag"
 	"github.com/yourname/dolphin/internal/scheduler/manager"
 )
 
@@ -23,6 +26,9 @@ type SchedulerService struct {
 
 	manager *manager.Manager
 	cron    func(expr string) (time.Time, error) // cron 求值函数（注入避免循环依赖）
+
+	// onTaskResult 任务执行结果回调（供 Reconciler 推送下游任务，事件驱动 DAG）。
+	onTaskResult func(taskID string)
 
 	// workers: workerID → 出站流
 	mu      sync.RWMutex
@@ -52,6 +58,11 @@ func NewSchedulerService(mgr *manager.Manager) *SchedulerService {
 // SetCronNext 注入 cron 求值函数（返回下一次触发时间）。
 func (s *SchedulerService) SetCronNext(fn func(expr string) (time.Time, error)) {
 	s.cron = fn
+}
+
+// SetOnTaskResult 注册任务执行结果回调。上游结果到达时由 Reconciler 推送下游任务。
+func (s *SchedulerService) SetOnTaskResult(fn func(taskID string)) {
+	s.onTaskResult = fn
 }
 
 // Dispatch 向指定 worker 下发任务（供 Reconciler 调用）。
@@ -203,6 +214,12 @@ func (s *SchedulerService) handleTaskResult(ctx context.Context, r *pb.TaskResul
 	db.WithContext(ctx).Model(&model.TaskLog{}).
 		Where("instance_id = ?", r.InstanceId).
 		Updates(updates)
+
+	// DAG 事件驱动：上游任务完成 → 通知 Reconciler 推送下游任务重新检查依赖。
+	// 相比等 1s 轮询扫描，事件推送让下游在毫秒级被唤醒（backstop 仍是扫描器）。
+	if s.onTaskResult != nil && r.TaskId != "" {
+		s.onTaskResult(r.TaskId)
+	}
 }
 
 // OnlineWorkers 获取当前实例内存注册表中持有活跃流的在线 worker 列表。
@@ -264,6 +281,15 @@ func (s *SchedulerService) CreateTask(ctx context.Context, req *pb.CreateTaskReq
 		Params:      req.Params,
 		Timeout:     int(req.Timeout),
 		MaxRetries:  int(req.MaxRetries),
+		DependOn:    dag.MarshalDependOn(req.DependOn),
+		DepPolicy:   req.DepPolicy,
+	}
+	if task.DepPolicy == "" {
+		task.DepPolicy = model.DepPolicyAllSuccess
+	}
+	// DAG 依赖校验：依赖策略合法、上游存在、加入候选后全量图无环。
+	if err := s.validateDeps(ctx, task); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	// 首次触发时间 = cron 的下一次执行时间
 	if s.cron != nil {
@@ -281,6 +307,45 @@ func (s *SchedulerService) CreateTask(ctx context.Context, req *pb.CreateTaskReq
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	return toProtoTask(created), nil
+}
+
+// validateDeps 校验 DAG 依赖图。
+// 始终校验：依赖策略合法、自依赖拒绝。manager 可用时再做全量图校验
+// （悬空引用 + 环），返回的具体错误（含环路径/缺失上游）直接透出给客户端。
+func (s *SchedulerService) validateDeps(ctx context.Context, task *model.Task) error {
+	deps, err := dag.ParseDependOn(task.DependOn)
+	if err != nil {
+		return err
+	}
+	if len(deps) == 0 {
+		return nil
+	}
+	if task.DepPolicy == "" {
+		task.DepPolicy = model.DepPolicyAllSuccess
+	}
+	if !model.DepPolicyValues[task.DepPolicy] {
+		return fmt.Errorf("%w: %q", dag.ErrInvalidDepPolicy, task.DepPolicy)
+	}
+	for _, up := range deps {
+		if up == task.ID {
+			return fmt.Errorf("task %s: self-dependency is not allowed", task.ID)
+		}
+	}
+	if s.manager == nil {
+		return nil // 单测场景无 DB，跳过全量图校验（dag 包单测已覆盖）
+	}
+	all, err := s.manager.ListAll(ctx)
+	if err != nil {
+		return err
+	}
+	if err := dag.ValidateDependOn(all, task); err != nil {
+		// 环是创建/更新最关键的失败：计入指标，便于面试硬数据。
+		if errors.Is(err, dag.ErrCycle) {
+			metrics.RecordDagCycleReject()
+		}
+		return err
+	}
+	return nil
 }
 
 // GetTask 获取任务。
@@ -319,6 +384,12 @@ func (s *SchedulerService) UpdateTask(ctx context.Context, req *pb.UpdateTaskReq
 		Params:      req.Params,
 		Timeout:     int(req.Timeout),
 		MaxRetries:  int(req.MaxRetries),
+		DependOn:    dag.MarshalDependOn(req.DependOn),
+		DepPolicy:   req.DepPolicy,
+	}
+	// DAG 依赖校验：更新后全量图无环（可能引入环/悬空引用）。
+	if err := s.validateDeps(ctx, task); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	if s.cron != nil {
 		next, err := s.cron(req.CronExpr)
@@ -415,6 +486,10 @@ func (s *SchedulerService) GetTaskLogs(ctx context.Context, req *pb.GetTaskLogsR
 
 // toProtoTask 转换 model.Task → pb.Task。
 func toProtoTask(t *model.Task) *pb.Task {
+	dependOn, err := dag.ParseDependOn(t.DependOn)
+	if err != nil {
+		dependOn = nil // 数据损坏时返回空依赖，不阻塞读取
+	}
 	return &pb.Task{
 		Id:          t.ID,
 		Name:        t.Name,
@@ -428,6 +503,8 @@ func toProtoTask(t *model.Task) *pb.Task {
 		Status:      t.Status,
 		CreatedAt:   t.CreatedAt.Unix(),
 		UpdatedAt:   t.UpdatedAt.Unix(),
+		DependOn:    dependOn,
+		DepPolicy:   t.DepPolicy,
 	}
 }
 

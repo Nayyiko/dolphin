@@ -37,6 +37,8 @@ message Task {
   string status = 10; // active/paused/deleted
   int64 created_at = 11;
   int64 updated_at = 12;
+  repeated string depend_on = 13; // 上游任务 ID 列表（DAG 依赖）
+  string dep_policy = 14;         // all_success / all_completed
 }
 
 message Empty {}
@@ -49,6 +51,8 @@ message CreateTaskRequest {
   string params = 5;
   int32 timeout = 6;
   int32 max_retries = 7;
+  repeated string depend_on = 8;
+  string dep_policy = 9;
 }
 
 message GetTaskRequest {
@@ -75,6 +79,8 @@ message UpdateTaskRequest {
   string params = 6;
   int32 timeout = 7;
   int32 max_retries = 8;
+  repeated string depend_on = 9;
+  string dep_policy = 10;
 }
 
 message DeleteTaskRequest {

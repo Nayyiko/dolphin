@@ -92,6 +92,16 @@ curl localhost:9090/metrics | grep dolphin
 ### Finalizers（优雅删除）
 删除任务时先通知 Worker 取消执行 → 标记日志 → 移除终结器 → 真正删除。
 
+### DAG 依赖编排
+任务通过 `depend_on` 声明上游构成有向无环图。创建/更新时用 Kahn 拓扑排序做**环检测**（拒绝环 + 悬空引用）；运行时按**新鲜度语义**做依赖门控（上游在本次调度后有成功/完成记录才放行，不串旧结果）；上游完成通过事件回调**毫秒级推送**下游。详见 [docs/architecture.md](docs/architecture.md)。
+
+```bash
+# 创建 DAG：b 依赖 a，c 依赖 a、b
+dolphinctl task create --name a --cron "*/1 * * * *" --handler http://localhost:9090/healthz
+dolphinctl task create --name b --cron "*/1 * * * *" --handler http://localhost:9090/healthz --depend-on <a-id>
+dolphinctl task create --name c --cron "*/1 * * * *" --handler http://localhost:9090/healthz --depend-on <a-id>,<b-id>
+```
+
 ## 目录结构
 
 ```

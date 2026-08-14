@@ -78,14 +78,16 @@ func (m *Manager) Update(ctx context.Context, task *model.Task) (*model.Task, er
 
 	task.UpdatedAt = time.Now()
 	result := m.db.WithContext(ctx).Model(&existing).Updates(map[string]any{
-		"name":        task.Name,
-		"cron_expr":   task.CronExpr,
-		"handler":     task.Handler,
+		"name":         task.Name,
+		"cron_expr":    task.CronExpr,
+		"handler":      task.Handler,
 		"handler_type": task.HandlerType,
-		"params":      task.Params,
-		"timeout":     task.Timeout,
-		"max_retries": task.MaxRetries,
-		"updated_at":  task.UpdatedAt,
+		"params":       task.Params,
+		"timeout":      task.Timeout,
+		"max_retries":  task.MaxRetries,
+		"depend_on":    task.DependOn,
+		"dep_policy":   task.DepPolicy,
+		"updated_at":   task.UpdatedAt,
 	})
 	if result.Error != nil {
 		return nil, fmt.Errorf("update task: %w", result.Error)
@@ -172,6 +174,17 @@ func (m *Manager) ListDueTasks(ctx context.Context, now time.Time) ([]model.Task
 		Where("status = ? AND next_run_at <= ? AND deletion_timestamp IS NULL", model.TaskStatusActive, now).
 		Find(&tasks).Error
 	if err != nil {
+		return nil, err
+	}
+	return tasks, nil
+}
+
+// ListAll 列出全部未删除任务。用于 DAG 环检测时加载全量依赖图。
+func (m *Manager) ListAll(ctx context.Context) ([]model.Task, error) {
+	var tasks []model.Task
+	if err := m.db.WithContext(ctx).
+		Where("deletion_timestamp IS NULL").
+		Find(&tasks).Error; err != nil {
 		return nil, err
 	}
 	return tasks, nil

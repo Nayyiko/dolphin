@@ -28,6 +28,16 @@ type Task struct {
 	// Status: active / paused / deleted（软删前的标记）。
 	Status string `gorm:"type:varchar(20);not null;default:'active';index:idx_status_next,priority:1" json:"status"`
 
+	// DependOn 上游任务 ID 列表（JSON 数组字符串，如 `["a","b"]`）。
+	// 非空时本任务构成 DAG 的依赖节点：只有依赖满足后才被调度。
+	// 依赖语义（task-level dependency）：
+	//   - all_success  : 每个上游在"本任务上次运行之后"至少有一次成功的执行。
+	//   - all_completed: 每个上游在"本任务上次运行之后"至少有一次完成的执行（success/failed/timeout）。
+	// "本任务上次运行之后" 保证依赖按新鲜度匹配，不会串到上一次运行的旧结果。
+	DependOn string `gorm:"type:text" json:"dependOn"`
+	// DepPolicy 依赖策略: all_success（默认）/ all_completed。
+	DepPolicy string `gorm:"type:varchar(20);not null;default:'all_success'" json:"depPolicy"`
+
 	// DeletionTimestamp 请求删除的时间。非空时由 Reconciler 执行优雅清理。
 	DeletionTimestamp *time.Time `gorm:"index" json:"deletionTimestamp,omitempty"`
 
@@ -42,6 +52,20 @@ const (
 	TaskStatusPaused  = "paused"
 	TaskStatusDeleted = "deleted"
 )
+
+// 依赖策略值。
+const (
+	// DepPolicyAllSuccess 所有上游在本次调度之后成功，才允许调度本任务。
+	DepPolicyAllSuccess = "all_success"
+	// DepPolicyAllCompleted 所有上游在本次调度之后完成（成功/失败/超时均可）。
+	DepPolicyAllCompleted = "all_completed"
+)
+
+// DepPolicyValues 合法的依赖策略。
+var DepPolicyValues = map[string]bool{
+	DepPolicyAllSuccess:  true,
+	DepPolicyAllCompleted: true,
+}
 
 // HandlerTypeValues 合法的执行方式。
 const (

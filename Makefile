@@ -21,8 +21,9 @@ help: ## 显示帮助信息
 
 proto: ## 生成 gRPC 桩代码
 	@echo "Generating protobuf..."
-	protoc --go_out=. --go_opt=paths=source_relative \
-		--go-grpc_out=. --go-grpc_opt=paths=source_relative \
+	# module=... 使输出目录跟随 go_package（api/proto/pb），而非 proto 文件所在目录。
+	protoc --go_out=. --go_opt=module=github.com/yourname/dolphin \
+		--go-grpc_out=. --go-grpc_opt=module=github.com/yourname/dolphin \
 		api/proto/scheduler.proto
 
 lint: ## 运行 go vet

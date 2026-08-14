@@ -18,6 +18,8 @@ const (
 	ConditionReady ConditionType = "Ready"
 	// ConditionReconciling 是否正在协调中。
 	ConditionReconciling ConditionType = "Reconciling"
+	// ConditionDeps 依赖是否满足。有上游依赖的任务在门控期间为 False/BlockedOnDeps。
+	ConditionDeps ConditionType = "Dependencies"
 )
 
 // ConditionStatus 条件状态。
@@ -63,4 +65,5 @@ var ValidConditionTypes = map[ConditionType]bool{
 	ConditionHealthy:     true,
 	ConditionReady:       true,
 	ConditionReconciling: true,
+	ConditionDeps:        true,
 }

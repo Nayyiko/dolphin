@@ -159,6 +159,30 @@ var (
 			Buckets: []float64{1, 5, 10, 15, 30, 60, 120},
 		},
 	)
+
+	// DAG 依赖阻塞的任务数（当前挂起等待上游）
+	SchedulerDagBlocked = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "dolphin_scheduler_dag_blocked_tasks",
+			Help: "Current number of tasks blocked on unmet dependencies.",
+		},
+	)
+
+	// 依赖门控次数：任务到期但因依赖未满足被挂起
+	SchedulerDagGateTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "dolphin_scheduler_dag_gate_total",
+			Help: "Total number of times a due task was held because dependencies were unmet.",
+		},
+	)
+
+	// DAG 环检测拒绝次数（创建/更新任务时）
+	SchedulerDagCycleRejectTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "dolphin_scheduler_dag_cycle_reject_total",
+			Help: "Total number of DAG create/update attempts rejected due to a cycle.",
+		},
+	)
 )
 
 // ═══════════════════════════════════════════════
@@ -252,6 +276,16 @@ func RecordReconcile(d time.Duration) {
 // RecordMissedSchedule 漏调度计数。
 func RecordMissedSchedule() {
 	SchedulerMissedSchedules.Inc()
+}
+
+// RecordDagGate 记录一次依赖门控（到期任务因依赖未满足被挂起）。
+func RecordDagGate() {
+	SchedulerDagGateTotal.Inc()
+}
+
+// RecordDagCycleReject 记录一次 DAG 环检测拒绝。
+func RecordDagCycleReject() {
+	SchedulerDagCycleRejectTotal.Inc()
 }
 
 // RecordFailoverRecovery 记录故障转移恢复耗时。

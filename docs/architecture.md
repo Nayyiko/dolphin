@@ -41,6 +41,37 @@ Push 模型延迟低。心跳复用同一连接。支持服务端主动下发任
 ### 为什么重试用指数退避？
 给下游恢复时间，避免雪崩。`baseDelay * 2^failures` 上限 maxDelay。
 
+## DAG 依赖编排
+
+任务通过 `depend_on` 声明上游，构成有向无环图。两个机制保证依赖正确且低延迟：
+
+### 创建时环检测（安全面）
+`CreateTask` / `UpdateTask` 时用 **Kahn 拓扑排序**校验全量依赖图，拒绝：
+- 环（返回环路径，如 `[a, b, a]`）；
+- 悬空引用（依赖不存在的任务）；
+- 自依赖、非法策略。
+
+拒绝发生在**写入数据库之前**，坏图永远进不了系统。
+
+### 运行时依赖门控（正确性面）
+任务到期后，Reconciler 先做依赖判定再决定是否下发：
+
+- **新鲜度语义**：每个上游必须在「本任务上次运行之后」有符合策略的执行，依赖不会串到上一次运行的旧结果（Makefile 式语义）。
+- **策略**：`all_success`（默认，上游成功）／ `all_completed`（上游完成即可，含失败/超时）。
+- **挂起不推进周期**：依赖未满足时保持 `next_run_at` 不变，不错误推进调度周期，也不重复下发。
+
+### 事件驱动唤醒（延迟面）
+上游执行结果到达时，server 层回调 Reconciler 推送直接依赖它的下游任务——**毫秒级唤醒**，不必等 1s 轮询扫描。扫描器仍作为兜底（最终一致性）。
+
+```
+A 完成 → TaskResult → server 回调 → EnqueueDependents(B, C) → 下游重新判定依赖
+```
+
+### DAG 指标
+- `dolphin_scheduler_dag_blocked_tasks`：当前被依赖阻塞的任务数（gauge）
+- `dolphin_scheduler_dag_gate_total`：依赖门控次数（到期未满足被挂起）
+- `dolphin_scheduler_dag_cycle_reject_total`：环检测拒绝次数
+
 ## SLO
 
 | SLI | SLO |

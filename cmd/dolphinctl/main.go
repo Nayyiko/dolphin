@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc"
@@ -101,7 +102,8 @@ func runTask(args []string) {
 	fs := flag.NewFlagSet("task", flag.ExitOnError)
 	fs.Usage = func() {
 		fmt.Println(`task 子命令:
-  create --name <n> --cron <expr> --handler <url> [--type http|shell] [--params <json>] [--timeout <sec>] [--retries <n>]
+  create --name <n> --cron <expr> --handler <url> [--type http|shell] [--params <json>] [--timeout <sec>] [--retries <n>] [--depend-on <id1,id2>] [--dep-policy all_success|all_completed]
+  update --id <id> --name <n> --cron <expr> --handler <url> [--type http|shell] [--depend-on <id1,id2>] [--dep-policy all_success|all_completed]
   list [--status <status>] [--limit <n>]
   get --id <id>
   trigger --id <id>
@@ -129,6 +131,8 @@ func runTask(args []string) {
 	switch sub {
 	case "create":
 		var name, cronExpr, handler, handlerType, params string
+		var dependOn string
+		var depPolicy string
 		var taskTimeout, retries int
 		fs := flag.NewFlagSet("create", flag.ExitOnError)
 		fs.StringVar(&name, "name", "", "task name")
@@ -138,6 +142,8 @@ func runTask(args []string) {
 		fs.StringVar(&params, "params", "", "params JSON")
 		fs.IntVar(&taskTimeout, "timeout", 30, "timeout seconds")
 		fs.IntVar(&retries, "retries", 3, "max retries")
+		fs.StringVar(&dependOn, "depend-on", "", "upstream task IDs, comma separated (DAG)")
+		fs.StringVar(&depPolicy, "dep-policy", "all_success", "dependency policy: all_success/all_completed")
 		_ = fs.Parse(subArgs)
 
 		if name == "" || cronExpr == "" || handler == "" {
@@ -153,9 +159,51 @@ func runTask(args []string) {
 			Params:      params,
 			Timeout:     int32(taskTimeout),
 			MaxRetries:  int32(retries),
+			DependOn:    splitCSV(dependOn),
+			DepPolicy:   depPolicy,
 		})
 		if err != nil {
 			slog.Error("create task failed", "err", err)
+			os.Exit(1)
+		}
+		printTask(resp)
+
+	case "update":
+		var id, name, cronExpr, handler, handlerType, params string
+		var dependOn string
+		var depPolicy string
+		var taskTimeout, retries int
+		fs := flag.NewFlagSet("update", flag.ExitOnError)
+		fs.StringVar(&id, "id", "", "task id")
+		fs.StringVar(&name, "name", "", "task name")
+		fs.StringVar(&cronExpr, "cron", "", "cron expression (5 fields)")
+		fs.StringVar(&handler, "handler", "", "handler URL or command")
+		fs.StringVar(&handlerType, "type", "http", "handler type: http/shell")
+		fs.StringVar(&params, "params", "", "params JSON")
+		fs.IntVar(&taskTimeout, "timeout", 30, "timeout seconds")
+		fs.IntVar(&retries, "retries", 3, "max retries")
+		fs.StringVar(&dependOn, "depend-on", "", "upstream task IDs, comma separated (DAG)")
+		fs.StringVar(&depPolicy, "dep-policy", "all_success", "dependency policy: all_success/all_completed")
+		_ = fs.Parse(subArgs)
+		if id == "" {
+			slog.Error("--id required")
+			fs.Usage()
+			os.Exit(1)
+		}
+		resp, err := client.UpdateTask(ctx, &pb.UpdateTaskRequest{
+			Id:          id,
+			Name:        name,
+			CronExpr:    cronExpr,
+			Handler:     handler,
+			HandlerType: handlerType,
+			Params:      params,
+			Timeout:     int32(taskTimeout),
+			MaxRetries:  int32(retries),
+			DependOn:    splitCSV(dependOn),
+			DepPolicy:   depPolicy,
+		})
+		if err != nil {
+			slog.Error("update task failed", "err", err)
 			os.Exit(1)
 		}
 		printTask(resp)
@@ -290,10 +338,33 @@ func runTask(args []string) {
 }
 
 func printTask(t *pb.Task) {
-	fmt.Printf("id=%s status=%s name=%s cron=%q next=%s type=%s\n",
+	deps := "[]"
+	if len(t.DependOn) > 0 {
+		deps = fmt.Sprintf("%v", t.DependOn)
+	}
+	fmt.Printf("id=%s status=%s name=%s cron=%q next=%s type=%s deps=%s policy=%s\n",
 		t.Id, t.Status, t.Name, t.CronExpr,
 		time.Unix(t.NextRunAt, 0).Format("2006-01-02 15:04:05"),
-		t.HandlerType)
+		t.HandlerType, deps, t.DepPolicy)
+}
+
+// splitCSV 将逗号分隔的字符串拆成列表，空串返回 nil。
+func splitCSV(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // ==================== stress 子命令 ====================

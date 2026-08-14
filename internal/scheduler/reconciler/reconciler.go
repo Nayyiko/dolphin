@@ -12,6 +12,7 @@ import (
 
 	"github.com/yourname/dolphin/internal/pkg/metrics"
 	"github.com/yourname/dolphin/internal/pkg/model"
+	"github.com/yourname/dolphin/internal/scheduler/dag"
 	"github.com/yourname/dolphin/internal/scheduler/informer"
 	"github.com/yourname/dolphin/internal/scheduler/manager"
 	"github.com/yourname/dolphin/internal/scheduler/queue"
@@ -55,6 +56,7 @@ type Reconciler struct {
 
 	mu     sync.Mutex
 	running map[string]bool // taskID → 正在执行中（避免重复调度）
+	blocked map[string]bool // taskID → 依赖未满足被挂起（用于 DAG 指标）
 }
 
 // NewReconciler 创建协调器。
@@ -78,6 +80,7 @@ func NewReconciler(
 		cronNext: cronNext,
 		workers:  numWorkers,
 		running:  make(map[string]bool),
+		blocked:  make(map[string]bool),
 	}
 }
 
@@ -89,6 +92,29 @@ func (r *Reconciler) EnqueueTask(taskID string) {
 // EnqueueAfter 延迟入队（预计算 cron 到期时间）。
 func (r *Reconciler) EnqueueAfter(taskID string, delay time.Duration) {
 	r.queue.AddAfter(taskID, delay)
+}
+
+// EnqueueDependents 上游任务完成时，推送直接依赖它的下游任务重新检查依赖。
+// 由 server 层在收到 TaskResult 后调用（事件驱动 DAG，毫秒级唤醒下游）。
+// 不校验上游结果状态——下游 reconcile 时会按自己的 DepPolicy 重新判定，
+// 失败的上游对 all_success 下游仍然保持阻塞。
+func (r *Reconciler) EnqueueDependents(upstreamID string) {
+	for _, item := range r.lister.List() {
+		t := item.Task
+		if t.Status != model.TaskStatusActive {
+			continue
+		}
+		deps, err := dag.ParseDependOn(t.DependOn)
+		if err != nil {
+			continue
+		}
+		for _, up := range deps {
+			if up == upstreamID {
+				r.EnqueueTask(t.ID)
+				break
+			}
+		}
+	}
 }
 
 // Run 启动多个并行 reconciler worker。
@@ -272,6 +298,23 @@ func (r *Reconciler) reconcile(ctx context.Context, taskID string) error {
 	// 4. 判断是否需要调度
 	need, reason := r.needExecution(ctx, &task)
 	if need {
+		// 4.1 DAG 依赖门控：依赖未满足则挂起。
+		// 保持 next_run_at 不变（仍处于 due），由到期扫描器（1s）和上游完成事件
+		// 共同兜底唤醒；不会错误推进调度周期，也不会重复下发。
+		satisfied, depReason, hasDeps := r.depsSatisfied(ctx, &task)
+		if hasDeps {
+			if !satisfied {
+				r.setBlocked(task.ID, true)
+				metrics.RecordDagGate()
+				r.setCondition(ctx, task.ID, model.ConditionDeps, model.StatusFalse,
+					"BlockedOnDeps", depReason)
+				slog.Debug("task blocked on dependencies", "task_id", task.ID, "reason", depReason)
+				return nil
+			}
+			r.setBlocked(task.ID, false)
+			r.setCondition(ctx, task.ID, model.ConditionDeps, model.StatusTrue,
+				"DepsSatisfied", "")
+		}
 		if err := r.dispatch(ctx, &task); err != nil {
 			return err
 		}
@@ -306,6 +349,68 @@ func (r *Reconciler) hasRunningInstance(ctx context.Context, taskID string) bool
 		Where("task_id = ? AND status = ?", taskID, model.TaskLogStatusRunning).
 		Count(&count)
 	return count > 0
+}
+
+// depsSatisfied 判断任务依赖是否满足，返回 (是否满足, 原因, 是否有依赖)。
+// 语义（新鲜度）：每个上游必须在"本任务上次运行之后"有符合策略的执行，
+// 保证依赖不会串到上一次运行的旧结果。
+func (r *Reconciler) depsSatisfied(ctx context.Context, task *model.Task) (bool, string, bool) {
+	deps, err := dag.ParseDependOn(task.DependOn)
+	if err != nil || len(deps) == 0 {
+		return true, "", false
+	}
+	policy := task.DepPolicy
+	if policy == "" {
+		policy = model.DepPolicyAllSuccess
+	}
+	lastRun := r.lastRunTime(ctx, task.ID)
+	lookup := func(upID string, after time.Time) *model.TaskLog {
+		return r.latestExecutionAfter(ctx, upID, after)
+	}
+	ok, reason := dag.DepsSatisfied(deps, policy, lastRun, lookup)
+	return ok, reason, true
+}
+
+// lastRunTime 返回任务最近一次执行的开始时间；从未运行返回零值。
+func (r *Reconciler) lastRunTime(ctx context.Context, taskID string) time.Time {
+	var logs []model.TaskLog
+	r.db.WithContext(ctx).
+		Where("task_id = ?", taskID).
+		Order("start_time DESC").
+		Limit(1).
+		Find(&logs)
+	if len(logs) == 0 {
+		return time.Time{}
+	}
+	return logs[0].StartTime
+}
+
+// latestExecutionAfter 返回 taskID 在 after 之后最近一次执行（任意状态）；无则 nil。
+func (r *Reconciler) latestExecutionAfter(ctx context.Context, taskID string, after time.Time) *model.TaskLog {
+	var logs []model.TaskLog
+	r.db.WithContext(ctx).
+		Where("task_id = ? AND start_time > ?", taskID, after).
+		Order("start_time DESC").
+		Limit(1).
+		Find(&logs)
+	if len(logs) == 0 {
+		return nil
+	}
+	return &logs[0]
+}
+
+// setBlocked 维护当前被依赖阻塞的任务集合，并同步 gauge 指标。
+func (r *Reconciler) setBlocked(taskID string, blocked bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, exists := r.blocked[taskID]
+	if blocked && !exists {
+		r.blocked[taskID] = true
+		metrics.SchedulerDagBlocked.Set(float64(len(r.blocked)))
+	} else if !blocked && exists {
+		delete(r.blocked, taskID)
+		metrics.SchedulerDagBlocked.Set(float64(len(r.blocked)))
+	}
 }
 
 // dispatch 选择 Worker 并下发任务。
@@ -380,9 +485,14 @@ func (r *Reconciler) dispatch(ctx context.Context, task *model.Task) error {
 }
 
 // handleMissedSchedule 补偿漏调度：next_run_at 已过期但未执行（可能因 Worker 不足）。
+// 注意：依赖未满足的任务（DAG 挂起）不做补偿，避免绕过依赖门控提前下发。
 func (r *Reconciler) handleMissedSchedule(ctx context.Context, task *model.Task) {
 	// 如果任务已经严重过期（> 5 分钟）且没有运行实例，说明漏调度了
 	if time.Since(task.NextRunAt) > 5*time.Minute && !r.hasRunningInstance(ctx, task.ID) {
+		if satisfied, _, hasDeps := r.depsSatisfied(ctx, task); hasDeps && !satisfied {
+			// DAG 挂起中，保持阻塞，等待上游。
+			return
+		}
 		metrics.RecordMissedSchedule()
 		slog.Warn("missed schedule detected", "task_id", task.ID,
 			"next_run_at", task.NextRunAt)

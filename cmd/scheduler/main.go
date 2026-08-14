@@ -141,6 +141,11 @@ func main() {
 	// Informer 事件 → 入队
 	inf.AddEventHandler(eventHandler{recon: recon})
 
+	// DAG 事件驱动：上游任务结果到达 → 推送下游任务重新检查依赖（毫秒级唤醒）。
+	svc.SetOnTaskResult(func(taskID string) {
+		recon.EnqueueDependents(taskID)
+	})
+
 	// 启动 Reconciler（仅在当前节点是 Leader 时运行核心调度）
 	// 简化：非 Leader 节点只运行 informer 同步，不跑 reconciler 主循环。
 	leaderElector := election.NewLeaderElector(etcdCli, "/dolphin/scheduler/leader",
