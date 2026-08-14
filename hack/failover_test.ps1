@@ -15,7 +15,9 @@ $Results = "$ProjectDir\results"
 New-Item -ItemType Directory -Force -Path $Results | Out-Null
 
 function Write-Step { param($msg) Write-Host "`n══════════ $msg ══════════" -ForegroundColor Green }
-function Ctl { param($args) & "$Bins\dolphinctl.exe" $args 2>&1 }
+# 注意：不能用 PowerShell 函数包装 dolphinctl——函数调用会把 "--addr" 当作
+# 命名参数解析并吞掉，导致 dolphinctl 把地址值当成 command（报 "unknown command: localhost:50052"）。
+# 必须直接 & 调用 exe，PowerShell 才会把 "--addr" 原样透传给 native 命令（diagnose.ps1 同款写法）。
 
 # ============ Step 0: 环境清理 ============
 Write-Step "Step 0/6: 环境清理"
@@ -183,13 +185,15 @@ if (-not $workersReady) { Write-Host "  ⚠️ 120s 内 worker 未重连到新 l
 Write-Host "创建 3 个 */1 cron 任务并立即触发..."
 $batch = Get-Date -Format "HHmmss"
 for ($i = 1; $i -le 3; $i++) {
-    $out = Ctl --addr "localhost:$followerGRPC" task create --name "failover-$batch-$i" --cron "*/1 * * * *" --handler "http://localhost:$followerPort/healthz" --timeout 5 --retries 1 2>&1
+    $out = & "$Bins\dolphinctl.exe" --addr "localhost:$followerGRPC" task create --name "failover-$batch-$i" --cron "*/1 * * * *" --handler "http://localhost:$followerPort/healthz" --timeout 5 --retries 1 2>&1
     Write-Host "  create #$i -> $out"
-    $idLine = ($out | Select-String "id=").ToString()
+    $idLine = $out | Select-String "id=" | Select-Object -First 1
     if ($idLine) {
-        $id = ($idLine -split " " | Where-Object { $_ -match "^id=" }) -replace "id=",""
-        Ctl --addr "localhost:$followerGRPC" task trigger --id $id 2>&1 | Out-Null
+        $id = (($idLine.ToString() -split " ") | Where-Object { $_ -match "^id=" }) -replace "id=",""
+        & "$Bins\dolphinctl.exe" --addr "localhost:$followerGRPC" task trigger --id $id 2>&1 | Out-Null
         Write-Host "  trigger #$i (id=$id)"
+    } else {
+        Write-Host "  ⚠️ 无法从输出解析 id，跳过 trigger"
     }
 }
 # 验证任务确实写入了 DB
