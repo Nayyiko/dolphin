@@ -1,4 +1,4 @@
-# bench_gateway_repro.ps1 — 网关裸吞吐复跑（替代无源的 2093 QPS）
+﻿# bench_gateway_repro.ps1 — 网关裸吞吐复跑（替代无源的 2093 QPS）
 # ============================================================
 # 背景：evidence-plan 写的"2093 QPS / P99<10ms"在仓库里没有任何原始报告；
 #       results/bench-report.txt 实测是 1569 QPS + P99 204ms + 490 连接错误，
@@ -27,6 +27,7 @@ $LOADGEN = Join-Path $PROJECT_DIR "bin\loadgen.exe"
 $REPORT  = Join-Path $PROJECT_DIR "results\gateway_bench_report.txt"
 $GW = "http://localhost:$Port"
 $TARGET = "$GW/health"
+New-Item -ItemType Directory -Force -Path (Join-Path $PROJECT_DIR "results") | Out-Null
 
 # ── 0. 环境检查 ──
 if (-not (Test-Path $LOADGEN)) {
@@ -34,7 +35,7 @@ if (-not (Test-Path $LOADGEN)) {
     Write-Host "  go build -o bin\loadgen.exe ./cmd/loadgen" -ForegroundColor Gray
     exit 1
 }
-$probe = curl.exe -s -o NUL -w "%{http_code}" "$GW/health"
+$probe = curl.exe -s --max-time 3 -o NUL -w "%{http_code}" "$GW/health"
 if ($probe -ne "200") {
     Write-Host "❌ gateway 未就绪（/health=$probe）。" -ForegroundColor Red
     Write-Host "请用关限流的压测配置起 gateway:" -ForegroundColor Yellow
@@ -42,7 +43,7 @@ if ($probe -ne "200") {
     exit 1
 }
 # 提醒：若当前 gateway 是正常配置（限流开启），吞吐会被限流拖累，结果仅作参考
-$limited = curl.exe -s "$GW/metrics" | Select-String -Pattern 'rate_limit_enabled|ratelimit_rejected_total'
+$limited = curl.exe -s --max-time 3 "$GW/metrics" | Select-String -Pattern 'rate_limit_enabled|ratelimit_rejected_total'
 Write-Host "⚠️  请确认当前 gateway 用的是 gateway_bench.yaml（关限流），否则测到的是受限流拖累的吞吐。" -ForegroundColor Yellow
 
 Write-Host "════════════════════════════════════════════" -ForegroundColor Cyan
@@ -52,6 +53,14 @@ Write-Host "══════════════════════�
 # ── 打流 ──
 $output = & $LOADGEN -url $TARGET -concurrency $Concurrency -duration "${DurationSec}s" 2>&1
 $output | Out-Host
+
+# ── 压测后健康探针 ──
+$postCode = curl.exe -s --max-time 3 -o NUL -w "%{http_code}" "$GW/health"
+$gatewayAlive = ($postCode -ne "000") -and ($postCode -ne "")
+if (-not $gatewayAlive) {
+    Write-Host "⚠️  压测后 /health 无响应（code=$postCode）——网关被压垮/失联，结果无效。" -ForegroundColor Yellow
+    Write-Host "   请重启 gateway 后，用 gateway_bench.yaml 重跑。" -ForegroundColor Yellow
+}
 
 # ── 解析 loadgen 输出 ──
 function Parse-Field([string]$Text, [string]$Pattern) {
@@ -82,7 +91,7 @@ Write-Host ("P99 延迟:   {0} ms" -f $p99)
 Write-Host ("错误率:     {0}  (总{1} 成功{2} 5xx{3} 连接错误{4})" -f $errRate, $total, $success, $err5xx, $connErr)
 
 # ── 存档 ──
-$report = @"
+$reportText = @"
 Dolphin 网关裸吞吐测试报告
 时间: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
 配置: Concurrency=$Concurrency Duration=${DurationSec}s Target=$TARGET (限流关闭)
@@ -95,20 +104,24 @@ P95: $p95 ms
 P99: $p99 ms
 错误率: $errRate
 "@
-[System.IO.File]::WriteAllText($REPORT, $report)
+[System.IO.File]::WriteAllText($REPORT, $reportText)
 Write-Host "报告已保存: $REPORT" -ForegroundColor Gray
 
 # ── 自动回填 docs/benchmark.md 网关压测表 ──
-$benchFile = Join-Path $PROJECT_DIR "docs\benchmark.md"
-$bench = [System.IO.File]::ReadAllText($benchFile)
-$updated = $bench
-$updated = $updated.Replace("| 网关 QPS | 10,000+ | ____ |", "| 网关 QPS | 10,000+ | $qps |")
-$updated = $updated.Replace("| P99 延迟 | < 5ms | ____ |", "| P99 延迟 | < 5ms | $p99 ms |")
-$updated = $updated.Replace("| P95 延迟 | < 2ms | ____ |", "| P95 延迟 | < 2ms | $p95 ms |")
-$updated = $updated.Replace("| 错误率 | < 0.1% | ____ |", "| 错误率 | < 0.1% | $errRate |")
-if ($updated -ne $bench) {
-    [System.IO.File]::WriteAllText($benchFile, $updated)
-    Write-Host "✅ docs/benchmark.md 网关压测表已回填实际值" -ForegroundColor Green
+if (-not $gatewayAlive) {
+    Write-Host "⚠️  网关压测后无响应，跳过 benchmark.md 回填。请重启 gateway 后重跑。" -ForegroundColor Yellow
 } else {
-    Write-Host "⚠️  未能匹配 benchmark.md 表格行（格式可能变了），未回填。请手动把上面数值填进 docs/benchmark.md。" -ForegroundColor Yellow
+    $benchFile = Join-Path $PROJECT_DIR "docs\benchmark.md"
+    $bench = [System.IO.File]::ReadAllText($benchFile)
+    $updated = $bench
+    $updated = $updated.Replace("| 网关 QPS | 10,000+ | ____ |", "| 网关 QPS | 10,000+ | $qps |")
+    $updated = $updated.Replace("| P99 延迟 | < 5ms | ____ |", "| P99 延迟 | < 5ms | $p99 ms |")
+    $updated = $updated.Replace("| P95 延迟 | < 2ms | ____ |", "| P95 延迟 | < 2ms | $p95 ms |")
+    $updated = $updated.Replace("| 错误率 | < 0.1% | ____ |", "| 错误率 | < 0.1% | $errRate |")
+    if ($updated -ne $bench) {
+        [System.IO.File]::WriteAllText($benchFile, $updated)
+        Write-Host "✅ docs/benchmark.md 网关压测表已回填实际值" -ForegroundColor Green
+    } else {
+        Write-Host "⚠️  未能匹配 benchmark.md 表格行（格式可能变了），未回填。请手动把上面数值填进 docs/benchmark.md。" -ForegroundColor Yellow
+    }
 }
