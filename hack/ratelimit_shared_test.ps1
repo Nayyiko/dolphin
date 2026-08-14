@@ -54,10 +54,19 @@ foreach ($gw in @($GW1, $GW2)) {
 function Get-RejectedTotal {
     param([string]$Base, [string]$PathLabel)
     for ($i = 0; $i -lt 5; $i++) {
-        $metrics = curl.exe -s "$Base/metrics"
-        $line = $metrics | Select-String -Pattern ('dolphin_gateway_ratelimit_rejected_total\{[^}]*path="' + [regex]::Escape($PathLabel) + '"[^}]*\}\s+(\d+)') | Select-Object -First 1
-        if ($line -and $line.Matches.Count -gt 0 -and $line.Matches[0].Groups[1].Success) {
-            return [long]$line.Matches[0].Groups[1].Value
+        $raw = curl.exe -s "$Base/metrics"
+        $lines = $raw | Select-String -Pattern 'dolphin_gateway_ratelimit_rejected_total'
+        if ($lines) {
+            $total = [long]0
+            foreach ($l in $lines) {
+                $txt = $l.Line
+                if ($txt -match ('endpoint="' + [regex]::Escape($PathLabel) + '"')) {
+                    $tok = ($txt -split '\s+')[-1]
+                    $v = [long]0
+                    if ([long]::TryParse($tok, [ref]$v)) { $total += $v }
+                }
+            }
+            return $total
         }
         Start-Sleep -Milliseconds 500
     }
@@ -146,7 +155,7 @@ Dolphin 多实例限流共享测试报告
 贴近度: 共享误差 $shareErr / 独立误差 $indepErr
 结果: $(if ($isShared) { "PASS - 共享限流" } else { "FAIL" })
 "@
-$report | Set-Content -Path $REPORT -Encoding UTF8
+[System.IO.File]::WriteAllText($REPORT, $report)
 Write-Host "报告已保存: $REPORT" -ForegroundColor Gray
 
 exit $(if ($isShared) { 0 } else { 1 })

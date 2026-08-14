@@ -95,19 +95,19 @@ P95: $p95 ms
 P99: $p99 ms
 错误率: $errRate
 "@
-$report | Set-Content -Path $REPORT -Encoding UTF8
+[System.IO.File]::WriteAllText($REPORT, $report)
 Write-Host "报告已保存: $REPORT" -ForegroundColor Gray
 
 # ── 自动回填 docs/benchmark.md 网关压测表 ──
 $benchFile = Join-Path $PROJECT_DIR "docs\benchmark.md"
-$bench = Get-Content $benchFile -Raw -Encoding UTF8
+$bench = [System.IO.File]::ReadAllText($benchFile)
 $updated = $bench
 $updated = $updated.Replace("| 网关 QPS | 10,000+ | ____ |", "| 网关 QPS | 10,000+ | $qps |")
 $updated = $updated.Replace("| P99 延迟 | < 5ms | ____ |", "| P99 延迟 | < 5ms | $p99 ms |")
 $updated = $updated.Replace("| P95 延迟 | < 2ms | ____ |", "| P95 延迟 | < 2ms | $p95 ms |")
 $updated = $updated.Replace("| 错误率 | < 0.1% | ____ |", "| 错误率 | < 0.1% | $errRate |")
 if ($updated -ne $bench) {
-    Set-Content -Path $benchFile -Value $updated -Encoding UTF8
+    [System.IO.File]::WriteAllText($benchFile, $updated)
     Write-Host "✅ docs/benchmark.md 网关压测表已回填实际值" -ForegroundColor Green
 } else {
     Write-Host "⚠️  未能匹配 benchmark.md 表格行（格式可能变了），未回填。请手动把上面数值填进 docs/benchmark.md。" -ForegroundColor Yellow

@@ -44,10 +44,19 @@ if ($probe -ne "200") {
 function Get-RejectedTotal {
     param([string]$Base, [string]$PathLabel)
     for ($i = 0; $i -lt 5; $i++) {
-        $metrics = curl.exe -s "$Base/metrics"
-        $line = $metrics | Select-String -Pattern ('dolphin_gateway_ratelimit_rejected_total\{[^}]*path="' + [regex]::Escape($PathLabel) + '"[^}]*\}\s+(\d+)') | Select-Object -First 1
-        if ($line -and $line.Matches.Count -gt 0 -and $line.Matches[0].Groups[1].Success) {
-            return [long]$line.Matches[0].Groups[1].Value
+        $raw = curl.exe -s "$Base/metrics"
+        $lines = $raw | Select-String -Pattern 'dolphin_gateway_ratelimit_rejected_total'
+        if ($lines) {
+            $total = [long]0
+            foreach ($l in $lines) {
+                $txt = $l.Line
+                if ($txt -match ('endpoint="' + [regex]::Escape($PathLabel) + '"')) {
+                    $tok = ($txt -split '\s+')[-1]
+                    $v = [long]0
+                    if ([long]::TryParse($tok, [ref]$v)) { $total += $v }
+                }
+            }
+            return $total
         }
         Start-Sleep -Milliseconds 500
     }
@@ -106,7 +115,13 @@ Dolphin 限流精确性测试报告
 实际拒绝(ΔR): $deltaReject
 结果: $(if ($pass) { "PASS" } else { "FAIL" })
 "@
-$report | Set-Content -Path $REPORT -Encoding UTF8
+[System.IO.File]::WriteAllText($REPORT, $report)
 Write-Host "报告已保存: $REPORT" -ForegroundColor Gray
+
+# ── 诊断：打印原始 ratelimit 指标行（确认 label 名与数值）──
+Write-Host ""
+Write-Host "── 原始 ratelimit 指标行（诊断用）──" -ForegroundColor Gray
+$rawMetrics = curl.exe -s "$GW/metrics"
+$rawMetrics | Select-String -Pattern 'ratelimit' | ForEach-Object { $_.Line }
 
 exit $(if ($pass) { 0 } else { 1 })
