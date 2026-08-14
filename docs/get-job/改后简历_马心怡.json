@@ -1,0 +1,46 @@
+{
+  "name": "马心怡",
+  "contact": "（手机待填） | （邮箱待填） | （所在城市待填）",
+  "objective": "Go 后端开发（校招/实习）| 武汉大学在读，具备 Go 并发、etcd 分布式一致性、MySQL/Redis 存储与 Prometheus 可观测实战能力，曾独立实现受 Kubernetes 控制器模式启发的分布式任务调度平台（选主/故障转移/幂等/限流），希望在 Go 后端 / 分布式系统方向持续深入。",
+  "sections": [
+    {
+      "title": "核心项目",
+      "entries": [
+        {
+          "title": "Dolphin 分布式任务调度平台",
+          "meta": "Go · etcd · MySQL · Redis · gRPC · Prometheus",
+          "subtitle": "个人项目 · 受 Kubernetes 控制器模式启发（独立设计与实现） · 代码：github.com/Nayyiko/dolphin",
+          "bullets": [
+            "借鉴 K8s 控制器模式，用 Informer 本地缓存 + WorkQueue 限速重试 + Reconcile 持续协调实现事件驱动调度，替代定时扫库；实测调度延迟 P50 约 1.4s / P99 约 2s，Reconciler 读本地缓存不查库，任务数增长不放大数据库压力。",
+            "基于 etcd Lease 实现多调度器选主，Lease 过期后旧主写入被拒绝，从机制上杜绝脑裂；实测 Leader 故障接管 N=10：11.2–15.64s（中位 13.35s），全部落在 [10,15]s 理论窗口，证明是真租约选举而非心跳判活。",
+            "以幂等 instance_id + 心跳超时重分发实现任务不丢不重；实测 Worker 故障恢复 N=5：22.68–29.4s（符合 [21,36]s 滑动窗口理论区间），幂等 5 次全 PASS，无重复 instance_id。",
+            "用 Redis + Lua 原子令牌桶实现多实例共享的分布式限流；实测 15000 请求中 429 数量与理论超限值精确吻合，避免「各实例独立限流导致总量翻倍」。",
+            "Worker 通过 etcd watch 动态发现当前 Leader 并自动切换连接（实测 4s 重连），配合 Leader 周期性重发布 + 连接失败 ResolveNow 兜底，故障转移链路端到端闭环。",
+            "全链路 Prometheus 埋点（调度延迟/选主状态/队列深度/worker 在线数）+ 故障注入测试体系（kill leader / kill worker / 慢任务）；go test -race 全过，Windows 交叉编译通过。"
+          ]
+        }
+      ]
+    },
+    {
+      "title": "教育背景",
+      "entries": [
+        {
+          "title": "武汉大学",
+          "meta": "在读 · 专业/年级待补",
+          "subtitle": "（待补：专业、入学年份、预计毕业时间、GPA 等，见素材缺口清单）"
+        }
+      ]
+    },
+    {
+      "title": "技能",
+      "type": "skills",
+      "items": [
+        {"category": "Go 语言与并发", "content": "goroutine / GMP 调度模型、channel、context、并发安全、内存逃逸与 GC、接口与泛型"},
+        {"category": "分布式系统", "content": "etcd 选主与 Lease、CAP / 一致性模型、分布式锁、幂等设计、故障转移与脑裂防护"},
+        {"category": "存储与缓存", "content": "MySQL（事务/索引/隔离级别/慢查询）、Redis（Lua 脚本/分布式锁/缓存）"},
+        {"category": "网络与协议", "content": "gRPC（双向流/Protobuf）、HTTP、TCP/IP"},
+        {"category": "工程与可观测", "content": "Prometheus 指标与排障、压测（vegeta/自研 loadgen）、故障注入、go test -race、Docker、Linux、Git"}
+      ]
+    }
+  ]
+}
