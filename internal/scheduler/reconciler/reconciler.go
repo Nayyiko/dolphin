@@ -230,7 +230,7 @@ func (r *Reconciler) checkWorkerHeartbeats(ctx context.Context, timeout time.Dur
 
 func (r *Reconciler) worker(ctx context.Context) {
 	for {
-		key, shutdown := r.queue.Get()
+		key, shutdown := r.queue.GetCtx(ctx)
 		if shutdown {
 			return
 		}

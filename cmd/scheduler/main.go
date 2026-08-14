@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -143,28 +144,67 @@ func main() {
 	// 简化：非 Leader 节点只运行 informer 同步，不跑 reconciler 主循环。
 	leaderElector := election.NewLeaderElector(etcdCli, "/dolphin/scheduler/leader",
 		hostname(), cfg.Election.TTL)
-	leaderElector.SetOnBecomeLeader(func(ctx context.Context) {
-		slog.Info("starting reconciler as leader")
-		go recon.Run(ctx)
-		go recon.RunDueTaskScanner(ctx, time.Second)
-		// Worker 心跳超时检测 + 故障转移。检测周期 = 心跳间隔，容忍阈值 = failover.heartbeat_timeout
-		heartbeatTimeout := cfg.Failover.HeartbeatTimeout
-		if heartbeatTimeout <= 0 {
-			heartbeatTimeout = 30 * time.Second
-		}
-		go recon.RunWorkerMonitor(ctx, heartbeatTimeout, 5*time.Second)
 
-		// 将本实例的 gRPC 地址发布到 etcd，并绑定到选主 lease。
-		// Worker 监听该 key，Leader 切换后自动连到新地址（发现机制）。
+	// leaderCtx 表示「当前任期的领导权」。失去领导权时 cancel，立即停止
+	// reconciler / 到期扫描 / worker 监控，避免失权节点继续调度或误判故障。
+	var (
+		leaderMu     sync.Mutex
+		leaderCancel context.CancelFunc
+	)
+
+	publishLeaderAddr := func(ctx context.Context) {
 		grpcAddr := fmt.Sprintf("localhost:%d", cfg.Server.GRPCPort)
 		if err := leaderElector.Publish(ctx, election.LeaderAddrKey, grpcAddr); err != nil {
 			slog.Warn("publish leader addr failed", "err", err)
 		} else {
 			slog.Info("published leader addr", "key", election.LeaderAddrKey, "addr", grpcAddr)
 		}
+	}
+
+	leaderElector.SetOnBecomeLeader(func(ctx context.Context) {
+		slog.Info("starting reconciler as leader")
+		lctx, lcancel := context.WithCancel(ctx)
+		leaderMu.Lock()
+		leaderCancel = lcancel
+		leaderMu.Unlock()
+
+		go recon.Run(lctx)
+		go recon.RunDueTaskScanner(lctx, time.Second)
+		// Worker 心跳超时检测 + 故障转移。检测周期 = 心跳间隔，容忍阈值 = failover.heartbeat_timeout
+		heartbeatTimeout := cfg.Failover.HeartbeatTimeout
+		if heartbeatTimeout <= 0 {
+			heartbeatTimeout = 30 * time.Second
+		}
+		go recon.RunWorkerMonitor(lctx, heartbeatTimeout, 5*time.Second)
+
+		// 将本实例的 gRPC 地址发布到 etcd，并绑定到选主 lease。
+		// 立即发布一次 + 每 5s 重发布：
+		//   - 立即发布：Worker 秒级发现新 Leader
+		//   - 周期重发布：即使前一个 Leader 的旧地址仍残留（其 lease 尚未过期），
+		//     新 Leader 的写入也会立即覆盖，保证 key 始终指向当前 Leader。
+		publishLeaderAddr(lctx)
+		go func() {
+			t := time.NewTicker(5 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-lctx.Done():
+					return
+				case <-t.C:
+					publishLeaderAddr(lctx)
+				}
+			}
+		}()
 	})
 	leaderElector.SetOnLoseLeader(func() {
-		slog.Warn("lost leadership")
+		slog.Warn("lost leadership, stopping leader-only loops")
+		leaderMu.Lock()
+		cancel := leaderCancel
+		leaderCancel = nil
+		leaderMu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
 	})
 	go func() {
 		if err := leaderElector.Campaign(ctx); err != nil && err != context.Canceled {

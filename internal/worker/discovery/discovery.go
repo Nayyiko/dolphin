@@ -84,3 +84,26 @@ func (d *Discoverer) Run(ctx context.Context) error {
 	}
 	return ctx.Err()
 }
+
+// ResolveNow 立即重新读取 leader 地址 key，若有值则回调 onUpdate。
+// 用于 Worker 连续连接失败时主动纠正地址（如 Leader 切换但 watch 事件尚未送达、
+// 或旧地址因 lease 未过期而残留）。幂等：地址未变时 UpdateAddr 自动忽略。
+func (d *Discoverer) ResolveNow() {
+	if d.cli == nil || d.onUpdate == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	resp, err := d.cli.Get(ctx, d.key)
+	if err != nil {
+		slog.Warn("leader addr re-resolve failed", "err", err)
+		return
+	}
+	for _, kv := range resp.Kvs {
+		if kv.Value != nil {
+			slog.Info("leader addr re-resolved", "addr", string(kv.Value), "rev", kv.ModRevision)
+			d.onUpdate(ctx, string(kv.Value))
+		}
+	}
+}

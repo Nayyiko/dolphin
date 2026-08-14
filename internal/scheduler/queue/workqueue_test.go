@@ -1,6 +1,7 @@
 package queue
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -143,5 +144,55 @@ func TestWorkQueue_ConcurrentAdd(t *testing.T) {
 	<-done
 	if item != "task-a" {
 		t.Fatalf("expected task-a")
+	}
+}
+
+func TestWorkQueue_GetCtxCancellation(t *testing.T) {
+	q := NewWorkQueue(time.Millisecond, time.Second)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		key, shutdown := q.GetCtx(ctx)
+		if !shutdown {
+			t.Errorf("expected shutdown on ctx cancel, got key=%q shutdown=%v", key, shutdown)
+		}
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+		// OK：ctx 取消后 GetCtx 应返回
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("GetCtx did not return after context cancellation")
+	}
+}
+
+func TestWorkQueue_GetCtxGetsItem(t *testing.T) {
+	q := NewWorkQueue(time.Millisecond, time.Second)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	got := make(chan string, 1)
+	go func() {
+		key, shutdown := q.GetCtx(ctx)
+		if !shutdown {
+			got <- key
+		}
+	}()
+
+	q.Add("task-x")
+	select {
+	case k := <-got:
+		if k != "task-x" {
+			t.Fatalf("expected task-x, got %q", k)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("GetCtx did not return queued item")
 	}
 }

@@ -36,6 +36,13 @@ type Client struct {
 	workerID string
 	maxConc  int
 
+	// Resolver, when set, is invoked after repeated connection failures to
+	// re-resolve the current leader address (e.g. re-read the etcd leader-addr
+	// key). This closes the failover loop: if the leader-addr key goes stale
+	// (old leader's lease not yet expired, watch event missed), the worker can
+	// actively re-discover instead of retrying a dead address forever.
+	Resolver func()
+
 	// sendMu 串行化同一 stream 的 Send，避免心跳与结果上报并发写同一流。
 	sendMu sync.Mutex
 	// hbCancel 用于停止当前连接的心跳循环（重连时先停旧心跳再建新连接）。
@@ -113,6 +120,7 @@ func (c *Client) Run(ctx context.Context) error {
 		if err := c.ensureConn(); err != nil {
 			slog.Warn("dial scheduler failed, retrying",
 				"err", err, "backoff", backoff)
+			c.maybeResolve(backoff)
 			if !sleep(ctx, backoff) {
 				return ctx.Err()
 			}
@@ -129,6 +137,7 @@ func (c *Client) Run(ctx context.Context) error {
 		if err != nil {
 			slog.Warn("connect to scheduler failed, retrying",
 				"err", err, "backoff", backoff)
+			c.maybeResolve(backoff)
 			if !sleep(ctx, backoff) {
 				return ctx.Err()
 			}
@@ -150,6 +159,7 @@ func (c *Client) Run(ctx context.Context) error {
 		}); err != nil {
 			slog.Warn("register failed, retrying", "err", err)
 			_ = stream.CloseSend()
+			c.maybeResolve(backoff)
 			if !sleep(ctx, backoff) {
 				return ctx.Err()
 			}
@@ -352,6 +362,16 @@ func (c *Client) Close() error {
 		return c.conn.Close()
 	}
 	return nil
+}
+
+// maybeResolve 在连续连接失败（backoff 已增长到 ≥8s）时，主动触发地址重解析。
+// 用于 Leader 已切换但 etcd watch 事件延迟/遗漏的场景，避免对死地址无限重试。
+// 限频：backoff 越大调用越稀疏，正常抖动时（1s/2s/4s）不触发。
+func (c *Client) maybeResolve(backoff time.Duration) {
+	if c.Resolver == nil || backoff < 8*time.Second {
+		return
+	}
+	c.Resolver()
 }
 
 // sleep 返回 true 表示正常睡满，false 表示 ctx 已取消。

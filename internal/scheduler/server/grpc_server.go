@@ -32,10 +32,12 @@ type SchedulerService struct {
 }
 
 type workerConn struct {
-	id       string
-	stream   pb.Scheduler_ConnectServer
-	sendMu   sync.Mutex // 串行化写入同一流
-	lastSeen time.Time
+	id             string
+	stream         pb.Scheduler_ConnectServer
+	sendMu         sync.Mutex // 串行化写入同一流
+	lastSeen       time.Time
+	currentLoad    int32 // 最近一次心跳上报的负载
+	maxConcurrency int32
 }
 
 // NewSchedulerService 创建 gRPC 服务。
@@ -105,9 +107,10 @@ func (s *SchedulerService) Connect(stream pb.Scheduler_ConnectServer) error {
 		case *pb.WorkerMessage_Register:
 			// 注册：建立 workerConn
 			wc = &workerConn{
-				id:       msg.Register.WorkerId,
-				stream:   stream,
-				lastSeen: time.Now(),
+				id:             msg.Register.WorkerId,
+				stream:         stream,
+				lastSeen:       time.Now(),
+				maxConcurrency: msg.Register.MaxConcurrency,
 			}
 			s.mu.Lock()
 			s.workers[msg.Register.WorkerId] = wc
@@ -126,6 +129,7 @@ func (s *SchedulerService) Connect(stream pb.Scheduler_ConnectServer) error {
 		case *pb.WorkerMessage_Heartbeat:
 			if wc != nil {
 				wc.lastSeen = time.Now()
+				wc.currentLoad = msg.Heartbeat.CurrentLoad
 			}
 			s.updateWorkerHeartbeat(context.Background(), msg.Heartbeat)
 			_ = stream.Send(&pb.SchedulerMessage{
@@ -201,11 +205,32 @@ func (s *SchedulerService) handleTaskResult(ctx context.Context, r *pb.TaskResul
 		Updates(updates)
 }
 
-// OnlineWorkers 获取在线 worker 列表（地址+负载），供 dispatcher 选择。
+// OnlineWorkers 获取当前实例内存注册表中持有活跃流的在线 worker 列表。
+//
+// 关键设计:只返回「本实例能真正下发」的 worker（有活跃 gRPC 流），
+// 而不是读 MySQL 里所有 status=online 的 worker。
+//
+// 为什么:
+//   - Dispatch 发送依赖本实例的内存 map；若 OnlineWorkers 读 MySQL 而
+//     某些 worker 的流其实连在别的 scheduler 上，本实例会选中它然后
+//     Dispatch 失败 → MarkWorkerOffline → 把一个健康 worker 误标离线，
+//     进而毒化所有节点的调度（故障转移场景的根因之一）。
+//   - 对齐 Kubernetes 哲学：Reconciler 只根据本地 informer 缓存决策，
+//     不信任共享 DB 的瞬态状态。
 func (s *SchedulerService) OnlineWorkers() []model.Worker {
-	db := s.manager.DB()
-	var workers []model.Worker
-	db.Where("status = ?", model.WorkerStatusOnline).Find(&workers)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	workers := make([]model.Worker, 0, len(s.workers))
+	for id, wc := range s.workers {
+		workers = append(workers, model.Worker{
+			ID:             id,
+			Status:         model.WorkerStatusOnline,
+			CurrentLoad:    int(wc.currentLoad),
+			MaxConcurrency: int(wc.maxConcurrency),
+			LastHeartbeat:  wc.lastSeen,
+		})
+	}
 	return workers
 }
 

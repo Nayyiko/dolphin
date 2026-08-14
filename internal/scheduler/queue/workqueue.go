@@ -1,6 +1,7 @@
 package queue
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -168,6 +169,39 @@ func (q *WorkQueue) Get() (string, bool) {
 		q.cond.Wait()
 	}
 	if q.shutdown {
+		return "", true
+	}
+
+	item := q.queue[0]
+	q.queue = q.queue[1:]
+
+	q.processing[item] = true
+	delete(q.dirty, item)
+
+	return item, false
+}
+
+// GetCtx 类似 Get，但 ctx 取消（或队列 ShutDown）时解除阻塞并返回 shutdown=true。
+// 用于 Leader 失权时让 reconciler worker 真正退出，而不是空等队列。
+func (q *WorkQueue) GetCtx(ctx context.Context) (string, bool) {
+	// ctx 取消时唤醒 cond 等待者；GetCtx 返回后停止 goroutine。
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-ctx.Done():
+			q.cond.Broadcast()
+		case <-stop:
+		}
+	}()
+
+	q.cond.L.Lock()
+	defer q.cond.L.Unlock()
+
+	for len(q.queue) == 0 && !q.shutdown && ctx.Err() == nil {
+		q.cond.Wait()
+	}
+	if q.shutdown || ctx.Err() != nil {
 		return "", true
 	}
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -33,6 +34,10 @@ type LeaderElector struct {
 
 	session  *concurrency.Session
 	election *concurrency.Election
+
+	// mu 保护 session/election 的并发访问。
+	// Publish 可能在新一轮 Campaign 替换 session 的同时读取旧 session，需要加锁。
+	mu sync.Mutex
 
 	isLeader atomic.Bool
 
@@ -69,11 +74,24 @@ func (le *LeaderElector) IsLeader() bool {
 // Leader 宕机 / 失去租约时，key 随 lease 自动过期删除；
 // Worker 通过监听该 key 发现并自动切换到新 Leader（故障转移的关键一环）。
 func (le *LeaderElector) Publish(ctx context.Context, key, value string) error {
-	if le.session == nil {
+	le.mu.Lock()
+	session := le.session
+	le.mu.Unlock()
+	if session == nil {
 		return fmt.Errorf("no session yet")
 	}
-	_, err := le.client.Put(ctx, key, value, clientv3.WithLease(le.session.Lease()))
+	_, err := le.client.Put(ctx, key, value, clientv3.WithLease(session.Lease()))
 	return err
+}
+
+// LeaseID 返回当前选主 session 的 lease ID（未就绪时返回 0）。
+func (le *LeaderElector) LeaseID() clientv3.LeaseID {
+	le.mu.Lock()
+	defer le.mu.Unlock()
+	if le.session == nil {
+		return clientv3.NoLease
+	}
+	return le.session.Lease()
 }
 
 // Campaign 参与选举。阻塞直到成为 Leader 或 ctx 取消。
@@ -85,21 +103,28 @@ func (le *LeaderElector) Campaign(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("create session: %w", err)
 	}
-	le.session = session
 
-	le.election = concurrency.NewElection(session, le.prefix)
+	election := concurrency.NewElection(session, le.prefix)
 
-	if err := le.election.Campaign(ctx, le.candidate); err != nil {
+	if err := election.Campaign(ctx, le.candidate); err != nil {
 		if err == context.Canceled || ctx.Err() != nil {
 			return ctx.Err()
 		}
 		return fmt.Errorf("campaign: %w", err)
 	}
 
+	le.mu.Lock()
+	le.session = session
+	le.election = election
+	le.mu.Unlock()
+
 	// 当选 Leader
 	le.isLeader.Store(true)
 	metrics.SchedulerLeaderElections.Inc()
-	slog.Info("became leader", "candidate", le.candidate)
+	slog.Info("became leader",
+		"candidate", le.candidate,
+		"election_key", election.Key(),
+		"lease_id", session.Lease())
 
 	// 监听 session 断开
 	go le.watchSession(ctx)
@@ -113,8 +138,15 @@ func (le *LeaderElector) Campaign(ctx context.Context) error {
 // watchSession 监听 session 断开（Lease 过期/连接断开）。
 // 断开后清理 Leader 状态，并自动重新竞选。
 func (le *LeaderElector) watchSession(ctx context.Context) {
+	le.mu.Lock()
+	session := le.session
+	le.mu.Unlock()
+	if session == nil {
+		return
+	}
+
 	select {
-	case <-le.session.Done():
+	case <-session.Done():
 		le.isLeader.Store(false)
 		slog.Warn("leader session lost, re-campaigning", "candidate", le.candidate)
 		if le.onLoseLeader != nil {
@@ -126,7 +158,7 @@ func (le *LeaderElector) watchSession(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		}
-		le.session.Close()
+		_ = session.Close()
 		_ = le.Campaign(ctx)
 	case <-ctx.Done():
 		le.Resign()
@@ -135,11 +167,18 @@ func (le *LeaderElector) watchSession(ctx context.Context) {
 
 // Resign 主动让位。
 func (le *LeaderElector) Resign() {
-	if le.election != nil {
-		_ = le.election.Resign(context.Background())
+	le.mu.Lock()
+	election := le.election
+	session := le.session
+	le.election = nil
+	le.session = nil
+	le.mu.Unlock()
+
+	if election != nil {
+		_ = election.Resign(context.Background())
 	}
-	if le.session != nil {
-		_ = le.session.Close()
+	if session != nil {
+		_ = session.Close()
 	}
 	le.isLeader.Store(false)
 }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync/atomic"
 	"testing"
+
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // fakeOnUpdate 用原子值记录最后一次回调，避免数据竞争。
@@ -67,4 +69,16 @@ func TestDiscovererRunNilClient(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for nil client, got nil")
 	}
+}
+
+// TestDiscovererResolveNowNilClient nil client 时 ResolveNow 不应 panic。
+func TestDiscovererResolveNowNilClient(t *testing.T) {
+	disc := New(nil, "/test/leader-addr", func(_ context.Context, _ string) {})
+	disc.ResolveNow()
+}
+
+// TestDiscovererResolveNowNilCallback nil onUpdate 时不应 panic（也不会发起 etcd Get）。
+func TestDiscovererResolveNowNilCallback(t *testing.T) {
+	disc := New(&clientv3.Client{}, "/test/leader-addr", nil)
+	disc.ResolveNow()
 }

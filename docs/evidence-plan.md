@@ -47,6 +47,18 @@
 - 数据：Lease 过期后，旧 Leader 的 etcd 写入返回 ErrLeaseNotFound
 - **面试讲**："这是 etcd 比 Redis 锁强的地方——Redis 锁过期后旧持有者还能写，etcd 的 Lease 过期后写入被拒绝，从机制上杜绝脑裂。"
 
+**证据 2c：Leader 失权立即停止调度（不是靠 etcd 拒绝才停）**
+- 背景：选主保证"单主"，但真正的分布式系统还要保证"只有主在干活"。旧 Leader 失权后若 Reconciler 仍继续调度，会造成"旧主还在下发 + 新主也下发"的双写混乱——即使 etcd 层面没有双主，业务层面也会像脑裂一样。
+- 修复：`onBecomeLeader` 创建可取消的 leader 上下文（`context.WithCancel`），`onLoseLeader` 立即 cancel，reconciler worker 通过 `queue.GetCtx(ctx)` 感知取消并退出；扫到期任务、Worker 心跳监控等 leader 专属循环同受此上下文管辖。
+- 数据：Leader 被 kill 后，旧进程（若残留）的 `dolphin_scheduler_is_leader` 立即变 0，且不再产生任何 Dispatch 调用。
+- **面试讲**："选主只是第一步。我额外保证失权即停：Leader 丢失 Lease 的瞬间，leader 专属循环被 context 取消，避免双写窗口。这是我理解'单主语义'不仅靠 etcd，还要靠自身生命周期管理的体现。"
+
+**证据 2d：调度器分发的一致性（内存注册表 vs 数据库）**
+- 背景：早期 `OnlineWorkers()` 读 MySQL，但 Dispatch 从内存 map 选 Worker。Leader 切换后，非流持有者读库选出一个 Worker，Dispatch 却因该 Worker 不在自己内存注册表而失败，还会把共享的 workers 表标记 offline——毒化状态。
+- 修复：`OnlineWorkers()` 改为返回内存注册表中持有活跃流的 Worker，保证"选出来的 Worker 一定能下发出"。
+- 数据：Leader 切换后调度不失败、workers 表不被误标 offline。
+- **面试讲**："调度器的一致性 bug 往往不在选主，而在'读的是库、写的是内存'这种数据源不一致。我统一到内存注册表，把'能选中'和'能下发'绑定到同一份数据。"
+
 ### 创新点 3：任务不丢不重
 
 **要证明的**：Worker 挂了任务自动恢复，且不重复执行。
@@ -58,9 +70,12 @@
 
 **证据 3a+：Leader 切换后 Worker 自动跟随（架构补齐）**
 - 背景：早期版本 Worker 把 Scheduler 地址写死在配置里。Leader 从 50051 切到 50052 后，Worker 无法发现新 Leader，故障转移链断掉。
-- 修复：Leader 当选后把 gRPC 地址写入 etcd（`/dolphin/scheduler/leader-addr`，绑定选主 Lease，Leader 死亡自动过期）；Worker 监听该 key，变化即切换连接。
-- 数据：Leader kill 后，Worker 通过 etcd watch 在秒级发现新地址并自动重连，无需重启。
-- **面试讲**："Worker 和 kubelet 一样，不硬编码 apiserver 地址，而是通过 etcd 发现当前 Leader。Leader 切换后 Worker 自动跟随，故障转移才是完整闭环。"
+- 修复（三层保障）：
+  1. Leader 当选后把 gRPC 地址写入 etcd（`/dolphin/scheduler/leader-addr`，绑定选主 Lease，Leader 死亡自动过期）；Worker 监听该 key，变化即切换连接。
+  2. Leader 每 5s 周期重发布 leader-addr，防 etcd 中该 key 意外缺失/过期导致 Worker 找不到地址。
+  3. Worker 侧双保险：连接/注册连续失败且退避达阈值（≥8s）时，主动 `ResolveNow()` 重新 Get 该 key，即使 watch 事件丢失也能自愈。
+- 数据：Leader kill 后，Worker 通过 etcd watch（或失败退避触发 ResolveNow）在秒级发现新地址并自动重连，无需重启。
+- **面试讲**："Worker 和 kubelet 一样，不硬编码 apiserver 地址，而是通过 etcd 发现当前 Leader。我还做了双保险：Leader 周期性重发布 + Worker 连接失败时主动重解析——watch 可能丢事件，但主动 Get 兜底，保证 Leader 切换后 Worker 一定跟随。"
 
 **证据 3b：不重复执行（幂等）**
 - 实验：kill Worker 后观察 TaskLog，确认没有同一个 instance_id 执行两次
@@ -89,10 +104,12 @@
 |--------|------|------|--------|
 | 1 | 调度延迟 P50/P99 | ✅ 已有（58 样本：P50 1.37s / P95 1.94s / P99 2s） | — |
 | 1 | 创建吞吐 | ✅ 已有 58/s | — |
-| 2 | Leader 故障转移 | ✅ 已有（1.22s 接管） | 复跑确认 |
+| 2 | Leader 故障转移 | ✅ 已有（1.22s 接管） | 复跑确认（脚本已加 3 次采样防抖） |
+| 2 | 脑裂防护（失权即停 + 单写） | ✅ 代码就绪 | 选主库单主保证 + onLoseLeader 取消循环 + 周期重发布 |
+| 2 | 调度器分发一致性 | ✅ 代码就绪 | 内存注册表统一"选中/下发"（证据 2d） |
 | 3 | Worker 故障转移 | ✅ 代码就绪，待复跑 | `failover_test.ps1`（已修复 */1 cron + Worker 发现跟随） |
 | 3 | 幂等验证 | ✅ 代码就绪，待复跑 | 观察 TaskLog 无重复 instance_id |
-| 3 | Worker 自动跟随 Leader | ✅ 代码就绪（etcd 发现机制） | kill Leader 后观察 Worker 自动切到新端口 |
+| 3 | Worker 自动跟随 Leader | ✅ 代码就绪（etcd 发现 + ResolveNow 兜底） | kill Leader 后观察 Worker 自动切到新端口 |
 | 4 | 精确限流 | ✅ 已有（vegeta 429 数据） | — |
 | 4 | 多实例共享 | ❌ 缺 | 起 2 gateway |
 | — | 裸网关吞吐 | ✅ 已有（2093 QPS） | 需重新交叉验证 |

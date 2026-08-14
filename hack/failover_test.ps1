@@ -58,13 +58,42 @@ try { $w2 = Invoke-WebRequest -Uri "http://localhost:9093/healthz" -UseBasicPars
 $workers = docker exec dolphin-mysql mysql -u root -pdolphin -N -e "SELECT COUNT(*) FROM dolphin.workers WHERE status='online';" 2>$null
 Write-Host "在线 worker 数: $workers (期望 2)"
 
-# 确认哪个 scheduler 是 leader
-$leader1 = (Invoke-WebRequest -Uri "http://localhost:9090/metrics" -UseBasicParsing -TimeoutSec 3).Content -match "dolphin_scheduler_is_leader 1"
-$leader2 = (Invoke-WebRequest -Uri "http://localhost:9092/metrics" -UseBasicParsing -TimeoutSec 3).Content -match "dolphin_scheduler_is_leader 1"
-Write-Host "scheduler1 is_leader: $leader1"
-Write-Host "scheduler2 is_leader: $leader2"
-if ($leader1) { $leaderPort = 9090; $followerPort = 9092; $leaderCfg = "scheduler.yaml" } else { $leaderPort = 9092; $followerPort = 9090; $leaderCfg = "scheduler2.yaml" }
-Write-Host "当前 Leader 端口: $leaderPort (配置 $leaderCfg)"
+# 确认哪个 scheduler 是 leader —— 多次采样，避免启动瞬间选举抖动/双主瞬态误判。
+function Get-IsLeader($port) {
+    try {
+        $m = (Invoke-WebRequest -Uri "http://localhost:$port/metrics" -UseBasicParsing -TimeoutSec 3).Content
+        return ($m -match "dolphin_scheduler_is_leader 1")
+    } catch { return $false }
+}
+
+$s1s = @(); $s2s = @()
+for ($i = 0; $i -lt 3; $i++) {
+    $s1s += [bool](Get-IsLeader 9090)
+    $s2s += [bool](Get-IsLeader 9092)
+    Start-Sleep 2
+}
+$leader1 = $s1s[-1]
+$leader2 = $s2s[-1]
+Write-Host "scheduler1 is_leader (3 次采样): $($s1s -join ',')"
+Write-Host "scheduler2 is_leader (3 次采样): $($s2s -join ',')"
+
+if ($leader1 -and $leader2) {
+    Write-Host "⚠️ 两个 scheduler 同时 is_leader=True（脑裂/抖动）！请检查 etcd 状态与 scheduler 日志" -ForegroundColor Yellow
+}
+if ($leader1 -and -not $leader2) { $leaderPort = 9090 }
+elseif ($leader2 -and -not $leader1) { $leaderPort = 9092 }
+elseif ($leader1 -and $leader2) {
+    # 双主异常：无法可靠判断，按 scheduler1 继续（后续结果需谨慎解读）
+    $leaderPort = 9090
+    Write-Host "双主异常，按 scheduler1 继续（测试结果需谨慎解读）" -ForegroundColor Yellow
+} else {
+    $leaderPort = $null
+    Write-Host "❌ 未检测到 Leader"
+}
+if ($leaderPort) {
+    if ($leaderPort -eq 9090) { $followerPort = 9092; $leaderCfg = "scheduler.yaml" } else { $followerPort = 9090; $leaderCfg = "scheduler2.yaml" }
+    Write-Host "当前 Leader 端口: $leaderPort (配置 $leaderCfg)"
+}
 
 # ============ Step 3: 测试 1 — Leader 故障转移 ============
 Write-Step "Step 3/6: 测试 Leader 故障转移"
@@ -121,13 +150,25 @@ Write-Step "Step 4/6: 测试 Worker 故障转移（任务不丢不重）"
 if ($leaderPort -eq 9090) { $followerGRPC = 50052 } else { $followerGRPC = 50051 }
 Write-Host "存活 scheduler 的 gRPC 端口: $followerGRPC"
 
-# 创建 3 个每 1 分钟执行的任务（*/1 cron，60s 内必触发一次）
+# Leader 切换后，等待 worker 通过 etcd 发现自动重连到新 leader（不重启）。
+# 轮询 workers 表直到 2 个 online（新 leader 的心跳续写会保持 online）。
+Write-Host "等待 worker 自动重连到新 leader..."
+$workersReady = $false
+for ($i = 0; $i -lt 30; $i++) {
+    Start-Sleep 1
+    $online = docker exec dolphin-mysql mysql -u root -pdolphin -N -e "SELECT COUNT(*) FROM dolphin.workers WHERE status='online';" 2>$null
+    if ($online -and [int]$online -ge 2) { Write-Host "  ✅ 2 个 worker 已 online（${i}s）"; $workersReady = $true; break }
+}
+if (-not $workersReady) { Write-Host "  ⚠️ ${i}s 内 worker 未全部 online，继续（可能影响调度）" }
+
+# 创建 3 个每 1 分钟执行的任务（*/1 cron，60s 内必触发一次）。
+# handler 指向存活 scheduler 的 healthz，保证 Leader 故障转移后执行仍能成功。
 Write-Host "创建 3 个 */1 cron 任务..."
 $batch = Get-Date -Format "HHmmss"
 for ($i = 1; $i -le 3; $i++) {
-    Ctl --addr "localhost:$followerGRPC" task create --name "failover-$batch-$i" --cron "*/1 * * * *" --handler http://localhost:9090/healthz --timeout 5 --retries 1 2>&1 | Out-Null
+    Ctl --addr "localhost:$followerGRPC" task create --name "failover-$batch-$i" --cron "*/1 * * * *" --handler "http://localhost:$followerPort/healthz" --timeout 5 --retries 1 2>&1 | Out-Null
 }
-Write-Host "已创建 3 个任务 (batch=$batch)"
+Write-Host "已创建 3 个任务 (batch=$batch, handler=localhost:$followerPort/healthz)"
 
 # 等待首轮调度（*/1 最多等 60s + 缓冲）
 Write-Host "等待首轮调度（最多 75s）..."

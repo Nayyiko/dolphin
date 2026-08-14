@@ -85,6 +85,8 @@ func main() {
 			disc := discovery.New(etcdCli, election.LeaderAddrKey, func(_ context.Context, addr string) {
 				cl.UpdateAddr(addr)
 			})
+			// 连接持续失败时，主动重新读取 leader 地址（兜底 watch 延迟/遗漏）。
+			cl.Resolver = disc.ResolveNow
 			go func() {
 				if err := disc.Run(ctx); err != nil && ctx.Err() == nil {
 					slog.Warn("leader discovery stopped", "err", err)
