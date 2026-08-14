@@ -62,18 +62,16 @@ Write-Step "0. 清理旧任务"
 docker exec dolphin-mysql mysql -u root -pdolphin -e "USE dolphin; DELETE FROM task_conditions; DELETE FROM task_logs; DELETE FROM tasks;" 2>$null
 Write-Host "已清理 tasks / task_logs / task_conditions"
 
-# ---------- 1. 批量创建 ----------
+# ---------- 1. 批量创建（stress create 进程内批量，比逐条 create 快 ~10x） ----------
 Write-Step "1. 批量创建 $TaskCount 个任务（handler sleep $SleepSeconds s）"
 $startCreate = Get-Date
-$ids = @()
-for ($i = 0; $i -lt $TaskCount; $i++) {
-    $out = & "$Bins\dolphinctl.exe" --addr "localhost:50051" task create --name "$NamePrefix$i" --cron "0 0 1 1 *" --handler "http://localhost:9090/debug/sleep?seconds=$SleepSeconds" 2>&1
-    if ($out -match 'id=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})') {
-        $ids += $Matches[1]
-    }
-}
+& "$Bins\dolphinctl.exe" --addr "localhost:50051" stress create --count $TaskCount --prefix $NamePrefix --cron "0 0 1 1 *" --handler "http://localhost:9090/debug/sleep?seconds=$SleepSeconds" --timeout ($SleepSeconds + 5) 2>&1 | Out-Null
 $createSec = ((Get-Date) - $startCreate).TotalSeconds
-$createRate = if ($createSec -gt 0) { $TaskCount / $createSec } else { 0 }
+# 收集本批任务 id（步骤 0 已清空 tasks，剩余都是本批）
+$idsRaw = SqlScalar "SELECT GROUP_CONCAT(id) FROM dolphin.tasks WHERE name LIKE '$NamePrefix%';"
+$ids = @()
+if ($idsRaw) { $ids = $idsRaw -split "," }
+$createRate = if ($createSec -gt 0) { $ids.Count / $createSec } else { 0 }
 Write-Host "  创建完成: $($ids.Count)/$TaskCount 个, 速率 $([math]::Round($createRate,1)) tasks/sec"
 Add-Content $OutFile "created=$($ids.Count) create_rate=$([math]::Round($createRate,1))"
 if ($ids.Count -eq 0) { Write-Host "❌ 创建失败，终止" -ForegroundColor Red; exit 1 }
@@ -83,12 +81,10 @@ Write-Step "2. 基线指标"
 $dispatchBefore = Get-Metric -Port 9090 -Name "dolphin_scheduler_dispatch_total"
 Write-Host "  dispatch_total 基线 = $dispatchBefore"
 
-# ---------- 3. 同时触发全部 ----------
+# ---------- 3. 同时触发全部（trigger-batch 单进程突发） ----------
 Write-Step "3. 同时触发 $($ids.Count) 个任务"
 $startTrig = Get-Date
-foreach ($id in $ids) {
-    & "$Bins\dolphinctl.exe" --addr "localhost:50051" task trigger --id $id 2>&1 | Out-Null
-}
+& "$Bins\dolphinctl.exe" --addr "localhost:50051" task trigger-batch --ids ($ids -join ",") 2>&1
 $trigSec = ((Get-Date) - $startTrig).TotalSeconds
 Write-Host "  全部触发完成，耗时 $([math]::Round($trigSec,2))s"
 Add-Content $OutFile "trigger_span_sec=$([math]::Round($trigSec,2))"
@@ -114,10 +110,10 @@ for ($i = 0; $i -lt $WaitMaxSec * 2; $i++) {
 
     $term = SqlScalar "SELECT COUNT(*) FROM dolphin.task_logs WHERE status IN ('success','failed','timeout');"
     if ([int]$term -ge $ids.Count) { $done = $true; break }
-    if ($i % 2 -eq 0) { Write-Host ("  [{0}s] 已完成 {1}/{2}  执行中峰值={3}" -f [math]::Round((Get-Date - $pollStart).TotalSeconds), $term, $ids.Count, $peakExec) }
+    $elapsedSec = ((Get-Date) - $pollStart).TotalSeconds
+    if ($i % 2 -eq 0) { Write-Host ("  [{0}s] 已完成 {1}/{2}  执行中峰值={3}" -f [math]::Round($elapsedSec), $term, $ids.Count, $peakExec) }
     Start-Sleep -Milliseconds 500
 }
-$pollSec = (Get-Date - $pollStart).TotalSeconds
 if ($null -eq $dispatchDoneAt) { $dispatchDoneAt = Get-Date }
 $dispatchDelta = $dispatchAfter - $dispatchBefore
 

@@ -107,6 +107,7 @@ func runTask(args []string) {
   list [--status <status>] [--limit <n>]
   get --id <id>
   trigger --id <id>
+  trigger-batch --ids <id1,id2,...>   # 进程内批量触发（并发压测用）
   pause --id <id>
   resume --id <id>
   delete --id <id>
@@ -256,6 +257,30 @@ func runTask(args []string) {
 			os.Exit(1)
 		}
 		fmt.Println("triggered")
+
+	case "trigger-batch":
+		// 进程内批量触发：一次进程发 N 个 gRPC TriggerTask，制造同时到期突发。
+		// 相比逐条 dolphinctl 调用（每次新进程 ~0.2s），把触发耗时从 O(N) 降到 ~O(N)/1000，
+		// 让 N 个任务几乎同时进入调度队列，测真实的调度/执行并发。
+		var ids string
+		fs := flag.NewFlagSet("trigger-batch", flag.ExitOnError)
+		fs.StringVar(&ids, "ids", "", "comma-separated task ids")
+		_ = fs.Parse(subArgs)
+		if ids == "" {
+			slog.Error("--ids required (comma-separated)")
+			os.Exit(1)
+		}
+		idList := splitCSV(ids)
+		start := time.Now()
+		ok := 0
+		for _, id := range idList {
+			if _, err := client.TriggerTask(ctx, &pb.TriggerTaskRequest{Id: id}); err != nil {
+				slog.Warn("trigger failed", "id", id, "err", err)
+				continue
+			}
+			ok++
+		}
+		fmt.Printf("triggered %d/%d in %s\n", ok, len(idList), time.Since(start).Round(time.Millisecond))
 
 	case "pause":
 		var id string
