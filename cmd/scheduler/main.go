@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -259,6 +260,21 @@ func main() {
 				_, _ = w.Write([]byte("ok"))
 			case "/metrics":
 				promhttp.Handler().ServeHTTP(w, r)
+			case "/debug/sleep":
+				// 调试用慢端点：让测试能构造"运行中"的任务，用于验证 Worker 故障转移。
+				// ?seconds=N 控制睡眠秒数，上限 120s，缺省立即返回。
+				secs, _ := strconv.Atoi(r.URL.Query().Get("seconds"))
+				if secs < 0 {
+					secs = 0
+				}
+				if secs > 120 {
+					secs = 120
+				}
+				if secs > 0 {
+					time.Sleep(time.Duration(secs) * time.Second)
+				}
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(fmt.Sprintf("slept %ds", secs)))
 			default:
 				http.NotFound(w, r)
 			}

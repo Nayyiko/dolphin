@@ -211,80 +211,88 @@ for ($i = 0; $i -lt 20; $i++) {  # 20 * 2s = 40s
 }
 if (-not $dispatched) { Write-Host "❌ 40s 内任务未调度，中止测试"; exit 1 }
 
-# 查看当前 task_log 分布在哪些 worker
-$logDump = docker exec dolphin-mysql mysql -u root -pdolphin -N -e "SELECT DISTINCT worker_id FROM dolphin.task_logs WHERE status='running' OR status='success' LIMIT 10;" 2>$null
-Write-Host "有执行记录的 workers: $logDump"
+# 查看当前 task_log 按 worker 分布（参考信息）
+$logDump = docker exec dolphin-mysql mysql -u root -pdolphin -N -e "SELECT worker_id, status, COUNT(*) FROM dolphin.task_logs GROUP BY worker_id, status;" 2>$null
+Write-Host "task_log 按 worker 分布:"
+$logDump
 
-# 识别 worker 进程与其 workerID 的对应关系（workerID = hostname-pid）
-$workerProcs = Get-Process -Name "worker" -ErrorAction SilentlyContinue
-Write-Host "`n当前 worker 进程:"
-foreach ($wp in $workerProcs) {
-    $wid = "{0}-{1}" -f $env:COMPUTERNAME, $wp.Id
-    # 注意：hostname 可能不是 COMPUTERNAME，这里只是预估
-    Write-Host "  PID=$($wp.Id) → workerID≈$wid"
-}
+# ============ 测试 Worker 故障转移 ============
+# 造一个"运行中"任务：handler 指向 scheduler 的 /debug/sleep 慢端点，睡 45s。
+# healthz 秒回，kill worker 时没有在飞任务，测不出故障转移；必须有一个 sleeping 任务。
+# timeout=60 > sleep=45，保证任务在 worker 上保持 running 状态足够久。
+Write-Host "`n创建 1 个慢任务（sleep 45s）并触发..."
+$slowOut = & "$Bins\dolphinctl.exe" --addr "localhost:$followerGRPC" task create --name "failover-slow-$batch" --cron "*/1 * * * *" --handler "http://localhost:$followerPort/debug/sleep?seconds=45" --timeout 60 --retries 1 2>&1
+Write-Host "  create slow -> $slowOut"
+$slowIdLine = $slowOut | Select-String "id=" | Select-Object -First 1
+if (-not $slowIdLine) {
+    Write-Host "❌ 慢任务创建失败，跳过 Worker 故障转移"
+} else {
+    $slowId = (($slowIdLine.ToString() -split " ") | Where-Object { $_ -match "^id=" }) -replace "id=",""
+    & "$Bins\dolphinctl.exe" --addr "localhost:$followerGRPC" task trigger --id $slowId 2>&1 | Out-Null
+    Write-Host "  trigger slow (id=$slowId)"
 
-# 选一个正在执行任务的 worker 杀掉。从 task_log 中找有记录的 worker，
-# 匹配 worker.exe 进程的 PID（workerID 含 PID）。
-$killWorker = $null
-$workersTable = docker exec dolphin-mysql mysql -u root -pdolphin -N -e "SELECT id, status, last_heartbeat FROM dolphin.workers;" 2>$null
-Write-Host "`nworkers 表:"
-$workersTable
-
-# 优先选有 task_log 记录的 worker。若无法精确匹配，杀第一个 worker。
-foreach ($wp in $workerProcs) {
-    $checkWid = "*-$($wp.Id)"
-    $hasLog = docker exec dolphin-mysql mysql -u root -pdolphin -N -e "SELECT COUNT(*) FROM dolphin.task_logs WHERE worker_id LIKE '$checkWid';" 2>$null
-    if ($hasLog -and [int]$hasLog -gt 0) {
-        $killWorker = $wp
-        Write-Host "选中 worker PID=$($wp.Id)（有 $hasLog 条执行记录）"
-        break
-    }
-}
-if (-not $killWorker -and $workerProcs.Count -ge 1) {
-    $killWorker = $workerProcs[0]
-    Write-Host "未精确匹配，退化为杀第一个 worker PID=$($killWorker.Id)"
-}
-
-if ($killWorker) {
-    # 记录 kill 时刻。workerID = <hostname>-<pid>，用 "*-<pid>" 模式匹配即可，
-    # 避免 hostname 与 COMPUTERNAME 不一致的问题。
-    $killTime = Get-Date
-    $killWid = "*-$($killWorker.Id)"
-    Write-Host "`n准备 kill Worker: PID=$($killWorker.Id), workerID 模式=$killWid"
-    Write-Host "Kill Worker 时间: $($killTime.ToString('HH:mm:ss.fff'))"
-
-    Stop-Process -Id $killWorker.Id -Force
-    Write-Host "已 kill Worker PID $($killWorker.Id)"
-
-    # 检测故障转移：等心跳超时(30s)+检测周期(5s)，该 worker 的 running 任务被
-    # 标记 failed 并重新调度到存活 worker。检测到"kill 之后、存活 worker 产生
-    # 新执行记录"即视为恢复。
-    Write-Host "等待故障转移（心跳超时 30s + 检测周期 5s + 重新调度）..."
-    $recovered = $false
-    for ($i = 0; $i -lt 30; $i++) {  # 最多 60s
+    # 等慢任务进入 running，记录它在哪个 worker 上跑（worker_id = <hostname>-<pid>）
+    Write-Host "等待慢任务进入 running..."
+    $runningWorker = $null
+    $runningInstance = $null
+    for ($i = 0; $i -lt 15; $i++) {  # 最多 30s
         Start-Sleep 2
-        $sql = "SELECT COUNT(*) FROM dolphin.task_logs WHERE start_time > '$($killTime.ToString('yyyy-MM-dd HH:mm:ss'))' AND worker_id NOT LIKE '$killWid';"
-        $newLogs = docker exec dolphin-mysql mysql -u root -pdolphin -N -e $sql 2>$null
-        if ($newLogs -and [int]$newLogs -gt 0) {
-            $newWorker = docker exec dolphin-mysql mysql -u root -pdolphin -N -e "SELECT DISTINCT worker_id FROM dolphin.task_logs WHERE start_time > '$($killTime.ToString('yyyy-MM-dd HH:mm:ss'))' AND worker_id NOT LIKE '$killWid' LIMIT 3;" 2>$null
-            $recoverTime = Get-Date
-            $elapsed = ($recoverTime - $killTime).TotalSeconds
-            Write-Host "✅ 检测到新执行记录（存活 worker 接管）"
-            Write-Host "  新记录 worker: $newWorker"
-            Write-Host "  恢复耗时: $($elapsed.ToString('F2'))s (从 kill 到新执行)"
-            Write-Host ""
-            Write-Host "  SLO 对标: 故障转移恢复 P99 < 30s (心跳超时 30s)"
-            if ($elapsed -le 30) { Write-Host "  ✅ 达标" } else { Write-Host "  ⚠️ 超过 30s" }
-            $recovered = $true
-            $workerRecoveryTime = $elapsed
+        $row = docker exec dolphin-mysql mysql -u root -pdolphin -N -e "SELECT CONCAT(worker_id,'|',instance_id) FROM dolphin.task_logs WHERE task_id='$slowId' AND status='running' LIMIT 1;" 2>$null
+        if ($row) {
+            $runningWorker = ($row -split '\|')[0]
+            $runningInstance = ($row -split '\|')[1]
+            Write-Host "  ✅ 慢任务 running: worker=$runningWorker instance=$runningInstance (${i}x2s)"
             break
         }
-        if ($i % 10 -eq 0) { Write-Host "  ...等待中 ($($i*2)s/60s)" }
+        if ($i % 5 -eq 0) { Write-Host "  ...等待中 ($($i*2)s/30s)" }
     }
-    if (-not $recovered) { Write-Host "❌ 60s 内未检测到任务恢复" }
-} else {
-    Write-Host "⚠️ 未找到 worker 进程"
+
+    if (-not $runningWorker) {
+        Write-Host "⚠️ 慢任务未进入 running，跳过 Worker 故障转移"
+    } else {
+        # 从 worker_id 提取 PID（尾随数字）。hostname 可能是中文/乱码，但 PID 可靠。
+        $killPid = $null
+        if ($runningWorker -match '-(\d+)$') { $killPid = [int]$matches[1] }
+        if (-not $killPid) {
+            Write-Host "⚠️ 无法从 worker_id 提取 PID，跳过"
+        } else {
+            $killTime = Get-Date
+            $killWid = "%-$killPid"   # MySQL 通配符是 %，不是 *
+            Write-Host "`n准备 kill Worker: PID=$killPid (workerID 模式=$killWid)"
+            Write-Host "Kill Worker 时间: $($killTime.ToString('HH:mm:ss.fff'))"
+            Stop-Process -Id $killPid -Force
+            Write-Host "已 kill Worker PID $killPid（慢任务正在其上运行）"
+
+            # 检测故障转移：心跳超时(30s)后，running 任务被标 failed 并重调度到存活 worker。
+            # 检测"kill 之后、存活 worker 上同一 task 产生新执行记录"即视为恢复。
+            # 注意 1：task_logs.start_time 存的是 UTC，比较时间必须转 UTC。
+            # 注意 2：按 task_id 过滤，避免被其它 */1 任务的 cron 重跑干扰。
+            Write-Host "等待故障转移（心跳超时 30s + 检测周期 5s + 重新调度）..."
+            $killTimeUtc = $killTime.ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')
+            $recovered = $false
+            for ($i = 0; $i -lt 45; $i++) {  # 最多 90s
+                Start-Sleep 2
+                $sql = "SELECT COUNT(*) FROM dolphin.task_logs WHERE task_id='$slowId' AND start_time > '$killTimeUtc' AND worker_id NOT LIKE '$killWid';"
+                $newLogs = docker exec dolphin-mysql mysql -u root -pdolphin -N -e $sql 2>$null
+                if ($newLogs -and [int]$newLogs -gt 0) {
+                    $newWorker = docker exec dolphin-mysql mysql -u root -pdolphin -N -e "SELECT DISTINCT worker_id FROM dolphin.task_logs WHERE task_id='$slowId' AND start_time > '$killTimeUtc' AND worker_id NOT LIKE '$killWid' LIMIT 3;" 2>$null
+                    $recoverTime = Get-Date
+                    $elapsed = ($recoverTime - $killTime).TotalSeconds
+                    Write-Host "✅ 检测到新执行记录（存活 worker 接管）"
+                    Write-Host "  新记录 worker: $newWorker"
+                    Write-Host "  恢复耗时: $($elapsed.ToString('F2'))s (从 kill 到新执行)"
+                    Write-Host ""
+                    Write-Host "  SLO 对标: 心跳超时 30s + 检测周期 5s ≈ 35s"
+                    if ($elapsed -le 40) { Write-Host "  ✅ 达标" } else { Write-Host "  ⚠️ 超过 40s，检查心跳超时配置" }
+                    $recovered = $true
+                    $workerRecoveryTime = $elapsed
+                    break
+                }
+                if ($i % 10 -eq 0) { Write-Host "  ...等待中 ($($i*2)s/90s)" }
+            }
+            if (-not $recovered) { Write-Host "❌ 90s 内未检测到任务恢复" }
+        }
+    }
 }
 
 # ============ Step 5: 幂等验证 ============
