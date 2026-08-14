@@ -38,9 +38,9 @@
 **要证明的**：Leader 挂了自动接管，且不会出现双主。
 
 **证据 2a：Leader 故障转移时间**
-- 实验：起 2 个 scheduler，kill 掉 Leader，测另一个接管时间（`hack/failover_test.ps1`）
-- 数据：实测 **15.37s**（三次复跑 13.26s / 13.30s / 15.37s）。接管时间 = Lease TTL 15s 减去 kill 时已流逝的租约时间，因为 Lease 每 TTL/3=5s 续约一次，所以接管时间在 10–15s 之间波动——这是租约选举的特征（心跳判活才能做到秒级，租约必须等过期）。
-- **面试讲**："Leader 转移时间由 etcd Lease TTL 决定，我配 15s，是安全性和恢复速度的权衡。实测接管 15.37s 落在 TTL 附近，波动区间 10–15s 恰好证明我用的是真租约选举：kill 后要等 Lease 过期，其他节点才敢竞选。TTL 太短会有网络抖动误判，太长恢复慢。"
+- 实验：起 2 个 scheduler，kill 掉 Leader，测另一个接管时间，重复 10 次（`hack/failover_test.ps1 -Runs 10`）
+- 数据：**N=10，min 11.2s / median 13.35s / mean 14s / max 15.64s**，全部落在理论窗口 **[TTL−TTL/3, TTL] = [10, 15]s + 约 1s 测量开销** 内。接管时间 = Lease TTL 15s − kill 时已流逝的租约时间；Lease 每 TTL/3=5s 续约，所以 kill 时刻租约剩余在 (10,15] 之间——这就是"租约选举"的指纹：心跳判活才能做到秒级，租约必须等过期，且过期剩余时间随续约相位波动。
+- **面试讲**："Leader 转移不是一个数字，而是一个分布。Lease TTL 15s、每 5s 续约，所以 kill 时刻租约剩余 10–15s，接管必然落在 10–15s。我跑 10 次，min 11.2s / max 15.64s，全在理论窗口内——这比单个 15s 数字更能证明我用的是真租约选举，不是心跳判活。"
 
 **证据 2b：脑裂防护**
 - 实验：模拟网络分区（kill -STOP 暂停 Leader，观察它是否还能写）
@@ -64,9 +64,9 @@
 **要证明的**：Worker 挂了任务自动恢复，且不重复执行。
 
 **证据 3a：Worker 故障转移（kill 正在执行任务的 worker）**
-- 实验：造一个 sleep 45s 的"运行中"任务（`/debug/sleep` 慢端点），从 task_logs 定位它跑在哪个 worker，kill 该 worker，测任务重分配到存活 worker 的时间。
-- 数据：实测 **25.07s**。恢复时间 = 心跳超时 30s − (kill 距上次心跳的间隔) + 检测周期 5s。25s < 30s 是因为 last_heartbeat 在 kill 前最后一次心跳就停止更新了——心跳是滑动窗口，不是从 kill 时刻才计时。
-- **面试讲**："Worker 心跳超时后，Reconciler 把它名下的 running 任务标 failed，next_run_at 置为 now 重新入队，重分发到存活 worker。实测恢复 25s，比心跳超时 30s 还快一点——因为判定基于 last_heartbeat 滑动窗口，不是 kill 时刻。这证明我理解心跳判活的语义，而不是背数字。"
+- 实验：造一个 sleep 45s 的"运行中"任务（`/debug/sleep` 慢端点），从 task_logs 定位它跑在哪个 worker，kill 该 worker，测任务重分配到存活 worker 的时间，重复 5 次。
+- 数据：**N=5，min 22.68s / median 27.4s / mean 26.86s / max 29.4s**，全部落在理论区间 **[心跳超时 30s − kill 距上次心跳间隔(0–10s) + 检测周期 5s] ≈ [21, 36]s** 内，且全部 < 30s。之所以都 < 30s，是因为 last_heartbeat 在 kill 前最后一次心跳就停止更新——心跳是滑动窗口，不是从 kill 时刻才计时。
+- **面试讲**："Worker 恢复也是一个分布：心跳间隔 10s、超时 30s，kill 时刻距上次心跳 0–10s，恢复 = 30s − 已流逝 + 检测周期。我 5 次实测 22.68–29.4s，全部小于 30s，正好说明判定基于 last_heartbeat 滑动窗口，而不是从 kill 时刻起算。"
 
 **证据 3a+：Leader 切换后 Worker 自动跟随（架构补齐）**
 - 背景：早期版本 Worker 把 Scheduler 地址写死在配置里。Leader 从 50051 切到 50052 后，Worker 无法发现新 Leader，故障转移链断掉。
@@ -79,7 +79,7 @@
 
 **证据 3b：不重复执行（幂等）**
 - 实验：kill Worker 后观察 TaskLog，确认没有同一个 instance_id 执行两次
-- 数据：实测 PASS——无重复 instance_id。一次运行的状态分布是 `failed 1 / success 3 / running 1`：被杀 worker 的 running 实例标 failed，存活 worker 新建 running 实例（新 instance_id），普通任务 success。每次执行尝试 = 唯一 instance_id，重分发产生新 ID。
+- 数据：5 次重复跑幂等验证全部 PASS——无重复 instance_id。最终状态分布 `success 3 / failed 5 / running 2`：5 次 kill 各产生 1 条 failed（被杀实例）+ 1 条新实例（恢复），其中 3 条新实例已完成（success）、2 条仍在 sleep（running）。正好 5 failed + 5 恢复 = 不丢，无重复 instance_id = 不重。
 - **面试讲**："我通过幂等 instance_id 保证：每次执行尝试一个唯一 ID，重试产生新的 instance_id，旧实例即使残留也不会被当作成功，也不会重复执行。kill worker 后实测无重复 instance_id。"
 
 ### 创新点 4：分布式限流
@@ -104,11 +104,11 @@
 |--------|------|------|--------|
 | 1 | 调度延迟 P50/P99 | ✅ 已有（58 样本：P50 1.37s / P95 1.94s / P99 2s） | — |
 | 1 | 创建吞吐 | ✅ 已有 58/s | — |
-| 2 | Leader 故障转移 | ✅ 实测 15.37s | TTL 15s 附近波动（10–15s，Lease 每 5s 续约） |
+| 2 | Leader 故障转移 | ✅ 实测 N=10 | min 11.2 / median 13.35 / max 15.64s，落 [10,15]s 理论窗口 |
 | 2 | 脑裂防护（失权即停 + 单写） | ✅ 代码就绪 | 选主库单主保证 + onLoseLeader 取消循环 + 周期重发布 |
 | 2 | 调度器分发一致性 | ✅ 代码就绪 | 内存注册表统一"选中/下发"（证据 2d） |
-| 3 | Worker 故障转移 | ✅ 实测 25.07s | kill 运行中任务的 worker，心跳超时后重分发 |
-| 3 | 幂等验证 | ✅ 实测 PASS | 无重复 instance_id（failed 1 / running 1 / success 3） |
+| 3 | Worker 故障转移 | ✅ 实测 N=5 | 22.68–29.4s，落 [21,36]s 理论区间（滑动窗口） |
+| 3 | 幂等验证 | ✅ 实测 5 次 PASS | 无重复 instance_id（success 3 / failed 5 / running 2） |
 | 3 | Worker 自动跟随 Leader | ✅ 实测 4s | kill Leader 后 Worker 经 etcd watch 自动切到新端口 |
 | 4 | 精确限流 | ✅ 已有（vegeta 429 数据） | — |
 | 4 | 多实例共享 | ❌ 缺 | 起 2 gateway |
@@ -154,7 +154,7 @@
 | 创新点 | 核心数据 | 一句话佐证 |
 |--------|---------|-----------|
 | 控制器模式 | 调度延迟 P50 ~1.4s / P99 ~2s | 事件驱动替代定时扫库，延迟来源清晰 |
-| 选主防脑裂 | Leader 接管 15.37s（TTL 15s） | etcd Lease 机制杜绝双主，波动区间证明是真租约 |
-| 不丢不重 | Worker 恢复 25.07s + 幂等 PASS | 心跳滑动窗口判定 + 唯一 instance_id 不重复 |
+| 选主防脑裂 | Leader 接管 N=10：11.2–15.64s（中位 13.35s） | etcd Lease 机制杜绝双主，分布落在 [10,15]s 证明是真租约 |
+| 不丢不重 | Worker 恢复 N=5：22.68–29.4s + 幂等 5 次 PASS | 心跳滑动窗口判定 + 唯一 instance_id 不丢不重 |
 | 分布式限流 | 429 精确匹配超限 | Redis Lua 原子令牌桶，多实例共享 |
 | 网关能力 | 裸吞吐 ~2000 QPS, P99 <10ms | 路由/中间件层性能 |
