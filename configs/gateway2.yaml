@@ -1,0 +1,27 @@
+# gateway2.yaml — 第二个网关实例（多实例限流共享实验用）
+# 与 gateway.yaml 唯一差异：server.port 8080 → 8081。
+# Redis/etcd/scheduler 地址保持共享，验证分布式限流在多个实例间共享同一个桶。
+server:
+  port: 8081
+  read_timeout: 10s
+  write_timeout: 30s
+  idle_timeout: 120s
+redis:
+  addr: localhost:6379
+  password: ""
+  db: 0
+jwt:
+  secret: "change-me-in-production"
+  expire_hours: 24
+rate_limit:
+  enabled: true
+  default_rate: 100
+  default_capacity: 200
+  window_seconds: 60
+circuit_breaker:
+  failure_threshold: 5
+  timeout: 30s
+  half_open_max: 3
+  enabled: true
+scheduler:
+  addr: localhost:50051

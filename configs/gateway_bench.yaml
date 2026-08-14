@@ -1,0 +1,28 @@
+# gateway_bench.yaml — 网关纯吞吐压测专用配置
+# 与 gateway.yaml 唯一差异：rate_limit.enabled: false
+# 用途：测"裸网关吞吐"（路由/中间件层性能），避免被限流器（rate=100/s）拖累。
+# 注意：本配置关闭限流，仅用于压测，不要用于正常开发环境。
+server:
+  port: 8080
+  read_timeout: 10s
+  write_timeout: 30s
+  idle_timeout: 120s
+redis:
+  addr: localhost:6379
+  password: ""
+  db: 0
+jwt:
+  secret: "change-me-in-production"
+  expire_hours: 24
+rate_limit:
+  enabled: false
+  default_rate: 100
+  default_capacity: 200
+  window_seconds: 60
+circuit_breaker:
+  failure_threshold: 5
+  timeout: 30s
+  half_open_max: 3
+  enabled: true
+scheduler:
+  addr: localhost:50051
