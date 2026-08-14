@@ -63,7 +63,7 @@ function Parse-Field([string]$Text, [string]$Pattern) {
 }
 
 # 每轮一条记录：qps/p95/p99/total/success/connErr/errRate/alive
-$rounds = @()
+$roundResults = @()
 
 for ($i = 1; $i -le $Rounds; $i++) {
     Write-Host ""
@@ -95,7 +95,7 @@ for ($i = 1; $i -le $Rounds; $i++) {
     $alive = ($postCode -ne "000") -and ($postCode -ne "")
 
     $valid = $alive -and ($connErrPct -ge 0) -and ($connErrPct -le $MaxConnErrPct)
-    $rounds += [pscustomobject]@{
+    $roundResults += [pscustomobject]@{
         Round = $i; Qps = $qps; P95 = $p95; P99 = $p99; Total = $total
         Success = $success; ConnErr = $connErr; ConnErrPct = $connErrPct
         ErrRate = $errRate; Alive = $alive; Valid = $valid
@@ -111,7 +111,7 @@ for ($i = 1; $i -le $Rounds; $i++) {
 }
 
 # ── 汇总：取"干净轮"中 QPS 最高的一轮 ──
-$validRounds = @($rounds | Where-Object { $_.Valid })
+$validRounds = @($roundResults | Where-Object { $_.Valid })
 $best = $null
 if ($validRounds.Count -gt 0) {
     $best = $validRounds | Sort-Object { [double]$_.Qps } -Descending | Select-Object -First 1
@@ -119,7 +119,7 @@ if ($validRounds.Count -gt 0) {
 
 Write-Host ""
 Write-Host "── 汇总 ──" -ForegroundColor Cyan
-$rounds | Format-Table -AutoSize Round, Qps, P95, P99, Total, ConnErr, ConnErrPct, Valid | Out-Host
+$roundResults | Format-Table -AutoSize Round, Qps, P95, P99, Total, ConnErr, ConnErrPct, Valid | Out-Host
 
 $reportText = ""
 if ($null -eq $best) {
@@ -147,7 +147,7 @@ P95: $($best.P95) ms
 P99: $($best.P99) ms
 错误率: $($best.ErrRate)
 每轮明细:
-$($rounds | Format-Table -AutoSize Round, Qps, P95, P99, Total, ConnErr, ConnErrPct, Valid | Out-String)
+$($roundResults | Format-Table -AutoSize Round, Qps, P95, P99, Total, ConnErr, ConnErrPct, Valid | Out-String)
 "@
 }
 [System.IO.File]::WriteAllText($REPORT, $reportText)
