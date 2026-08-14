@@ -3,7 +3,6 @@ package executor
 import (
 	"context"
 	"fmt"
-	"sort"
 
 	"github.com/google/uuid"
 
@@ -25,17 +24,27 @@ type WorkerSelector interface {
 	Select(workers []model.Worker) *model.Worker
 }
 
-// LeastLoadedSelector 最少负载优先：选择 current_load / max_concurrency 最小的 Worker。
+// LeastLoadedSelector 最少负载优先：选择 current_load / max_concurrency 比值最小的 Worker。
+// 用负载比而非绝对值，保证 max_concurrency 不统一的混合集群也能正确选到"最闲"的节点。
 type LeastLoadedSelector struct{}
 
 func (LeastLoadedSelector) Select(workers []model.Worker) *model.Worker {
 	if len(workers) == 0 {
 		return nil
 	}
-	sort.Slice(workers, func(i, j int) bool {
-		return workers[i].CurrentLoad < workers[j].CurrentLoad
-	})
-	return &workers[0]
+	loadRatio := func(w model.Worker) float64 {
+		if w.MaxConcurrency <= 0 {
+			return float64(w.CurrentLoad) // 缺省值保护，避免除零
+		}
+		return float64(w.CurrentLoad) / float64(w.MaxConcurrency)
+	}
+	best := 0
+	for i := 1; i < len(workers); i++ {
+		if loadRatio(workers[i]) < loadRatio(workers[best]) {
+			best = i
+		}
+	}
+	return &workers[best]
 }
 
 // RoundRobinSelector 轮询选择。
