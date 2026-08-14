@@ -39,8 +39,13 @@ type GatewayConfig struct {
 // SchedulerConfig 调度器配置。
 type SchedulerConfig struct {
 	Server struct {
-		GRPCPort int `yaml:"grpc_port"`
-		HTTPPort int `yaml:"http_port"` // metrics / health
+		GRPCPort int    `yaml:"grpc_port"`
+		HTTPPort int    `yaml:"http_port"` // metrics / health
+		// AdvertiseAddr 发布给 Worker 的 Leader gRPC 地址。
+		// 默认空 → 用 localhost:<grpc_port>（单机/容器同宿主机场景）。
+		// 多机/K8s 场景必须显式配置可达地址（如 Pod IP:50051），
+		// 否则 Worker 通过 etcd 发现的 leader-addr 连不上自己所在的 localhost。
+		AdvertiseAddr string `yaml:"advertise_addr"`
 	} `yaml:"server"`
 	Etcd struct {
 		Endpoints   []string      `yaml:"endpoints"`

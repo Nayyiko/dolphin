@@ -1,0 +1,47 @@
+# worker — 执行面。
+# 无需 Service：scheduler 通过 gRPC 双向流主动下发，Worker 反向通过 etcd 发现
+# Leader 地址并建立连接。replicas=2 演示最少负载选择器在多 Worker 间的分配。
+# 扩容/缩容即可水平扩展执行能力（执行并发上限 = 副本数 × pool.capacity）。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: dolphin
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      containers:
+        - name: worker
+          image: dolphin-worker:latest
+          imagePullPolicy: IfNotPresent
+          args: ["-config", "/app/configs/worker.yaml"]
+          ports:
+            - name: metrics
+              containerPort: 9091
+          volumeMounts:
+            - name: config
+              mountPath: /app/configs
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9091
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 200m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+      volumes:
+        - name: config
+          configMap:
+            name: dolphin-worker-config

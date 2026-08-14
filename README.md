@@ -155,6 +155,7 @@ go build -o bin\loadgen.exe ./cmd/loadgen
 
 - [架构设计](docs/architecture.md)
 - [面试要点](docs/interview.md)
+- [K8s 部署](docs/k8s-deploy.md) — 一键 `make k8s-images && make k8s-apply`，含控制面 HA / Worker 发现 / 面试讲法
 
 ## License
 

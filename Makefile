@@ -1,6 +1,6 @@
 # Dolphin — 构建系统
 
-.PHONY: help proto lint test test-cover bench build build-linux docker-build infra-up infra-down run-gateway run-scheduler run-worker smoke bench-gateway bench-schedule failover clean
+.PHONY: help proto lint test test-cover bench build build-linux docker-build infra-up infra-down run-gateway run-scheduler run-worker smoke bench-gateway bench-schedule failover k8s-images k8s-apply k8s-delete clean
 
 APP_NAME := dolphin
 REGISTRY := docker.io/$(USER)
@@ -107,6 +107,19 @@ failover: ## 故障注入测试（Worker 宕机恢复）
 
 bench-full: ## 完整闭环压测（Windows: powershell .\hack\bench_full.ps1）
 	@echo "Windows 下运行: powershell -ExecutionPolicy Bypass .\\hack\\bench_full.ps1"
+
+# ─── K8s 部署 ───
+k8s-images: ## 构建三个组件镜像（本地 tag，便于 kind/minikube 直接使用）
+	docker build -t dolphin-gateway:latest   -f deployments/docker/Dockerfile.gateway   .
+	docker build -t dolphin-scheduler:latest -f deployments/docker/Dockerfile.scheduler .
+	docker build -t dolphin-worker:latest    -f deployments/docker/Dockerfile.worker    .
+
+k8s-apply: ## 部署 Dolphin 到 K8s（需 kubectl + 集群）
+	kubectl apply -k deployments/k8s
+	@echo "已部署。查看: kubectl -n dolphin get all"
+
+k8s-delete: ## 卸载 K8s 部署
+	kubectl delete -k deployments/k8s
 
 clean: ## 清理构建产物
 	rm -rf bin/

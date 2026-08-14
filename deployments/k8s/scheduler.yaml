@@ -1,0 +1,80 @@
+# scheduler — 控制面（etcd 选主，2 副本 HA）。
+# 任意时刻仅 Leader 运行 Reconciler 主循环；两个副本都提供管理 gRPC API，
+# gateway 通过 dolphin-scheduler Service 负载均衡即可。
+# 关键点：DOLPHIN_ADVERTISE_ADDR 用 Downward API 取 Pod IP 拼成 <podIP>:50051，
+# 否则 Worker 从 etcd 发现的 leader-addr 会是各 Pod 自己的 localhost，连不上。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scheduler
+  namespace: dolphin
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: scheduler
+  template:
+    metadata:
+      labels:
+        app: scheduler
+    spec:
+      containers:
+        - name: scheduler
+          image: dolphin-scheduler:latest
+          imagePullPolicy: IfNotPresent
+          args: ["-config", "/app/configs/scheduler.yaml"]
+          env:
+            # 顺序重要：$(POD_IP) 引用的是同容器内先前定义的变量。
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: DOLPHIN_ADVERTISE_ADDR
+              value: "$(POD_IP):50051"
+          ports:
+            - name: grpc
+              containerPort: 50051
+            - name: http
+              containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /app/configs
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9090
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9090
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+      volumes:
+        - name: config
+          configMap:
+            name: dolphin-scheduler-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dolphin-scheduler
+  namespace: dolphin
+spec:
+  selector:
+    app: scheduler
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+    - name: http
+      port: 9090
+      targetPort: 9090

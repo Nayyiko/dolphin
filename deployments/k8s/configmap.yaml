@@ -1,0 +1,83 @@
+# 三个组件的配置（覆盖镜像内默认 localhost 配置）。
+# 通过 ConfigMap 挂载到 /app/configs/*.yaml，保持 Dockerfile 的 -config 约定不变。
+# 关键差异：所有端点改为 K8s Service DNS 名；scheduler 的 advertise_addr 由
+# Deployment 里 Downward API 注入 Pod IP 拼成（见 scheduler.yaml）。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dolphin-scheduler-config
+  namespace: dolphin
+data:
+  scheduler.yaml: |
+    server:
+      grpc_port: 50051
+      http_port: 9090
+    etcd:
+      endpoints:
+        - http://dolphin-etcd:2379
+      dial_timeout: 5s
+    election:
+      ttl: 15
+    mysql:
+      dsn: root:dolphin@tcp(dolphin-mysql:3306)/dolphin?parseTime=true&charset=utf8mb4
+    redis:
+      addr: dolphin-redis:6379
+      password: ""
+      db: 0
+    reconciler:
+      workers: 4
+    failover:
+      heartbeat_timeout: 30s
+      max_retries: 3
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dolphin-worker-config
+  namespace: dolphin
+data:
+  worker.yaml: |
+    server:
+      metrics_port: 9091
+    scheduler:
+      addr: dolphin-scheduler:50051
+    etcd:
+      endpoints:
+        - http://dolphin-etcd:2379
+      dial_timeout: 5s
+    pool:
+      capacity: 50
+    heartbeat:
+      interval: 10s
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dolphin-gateway-config
+  namespace: dolphin
+data:
+  gateway.yaml: |
+    server:
+      port: 8080
+      read_timeout: 10s
+      write_timeout: 30s
+      idle_timeout: 120s
+    redis:
+      addr: dolphin-redis:6379
+      password: ""
+      db: 0
+    jwt:
+      secret: "change-me-in-production"
+      expire_hours: 24
+    rate_limit:
+      enabled: true
+      default_rate: 100
+      default_capacity: 200
+      window_seconds: 60
+    circuit_breaker:
+      failure_threshold: 5
+      timeout: 30s
+      half_open_max: 3
+      enabled: true
+    scheduler:
+      addr: dolphin-scheduler:50051

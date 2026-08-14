@@ -1,0 +1,14 @@
+# Dolphin on K8s — Kustomize 入口
+# 用法: kubectl apply -k deployments/k8s
+# 查看: kubectl -n dolphin get all
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - etcd.yaml
+  - mysql.yaml
+  - redis.yaml
+  - configmap.yaml
+  - scheduler.yaml
+  - worker.yaml
+  - gateway.yaml

@@ -158,8 +158,20 @@ func main() {
 		leaderCancel context.CancelFunc
 	)
 
+	// 发布给 Worker 的 Leader 地址：环境变量 DOLPHIN_ADVERTISE_ADDR > 配置
+	// server.advertise_addr > 默认 localhost:<grpc_port>。
+	// K8s 场景用 Downward API 注入 Pod IP（见 deployments/k8s/scheduler.yaml），
+	// 否则 Worker 连 localhost 会指向自己所在的 Pod。
+	advertiseAddr := os.Getenv("DOLPHIN_ADVERTISE_ADDR")
+	if advertiseAddr == "" {
+		advertiseAddr = cfg.Server.AdvertiseAddr
+	}
+	if advertiseAddr == "" {
+		advertiseAddr = fmt.Sprintf("localhost:%d", cfg.Server.GRPCPort)
+	}
+
 	publishLeaderAddr := func(ctx context.Context) {
-		grpcAddr := fmt.Sprintf("localhost:%d", cfg.Server.GRPCPort)
+		grpcAddr := advertiseAddr
 		if err := leaderElector.Publish(ctx, election.LeaderAddrKey, grpcAddr); err != nil {
 			slog.Warn("publish leader addr failed", "err", err)
 		} else {
