@@ -160,6 +160,47 @@ func (ti *TaskInformer) GetLister() TaskLister {
 	return ti.store
 }
 
+// watchLookback 增量同步水位的回退窗口。
+//
+// updated_at 由 gorm 在「构建 INSERT/UPDATE 语句」时用 Go 时钟赋值，而行的可见性要
+// 等到「提交」才发生，二者之间隔着一次 MySQL 往返（本环境 ~20-50ms，负载下可上百 ms）。
+// 若水位只推进到 max(updated_at)，一个「构建早、提交晚」的行会被下一轮 `updated_at > lastSync`
+// 永久漏掉。回退一个足够大的窗口（1s，>10x 余量）把这类乱序提交的行兜回来；
+// 重读是幂等 upsert，reconcile 对 next_run_at 已推进的任务是 no-op，无副作用。
+const watchLookback = time.Second
+
+// maxTaskUpdatedAt 返回切片中最大的 updated_at（空切片返回零值）。
+func maxTaskUpdatedAt(tasks []model.Task) time.Time {
+	var maxUpdated time.Time
+	for i := range tasks {
+		if tasks[i].UpdatedAt.After(maxUpdated) {
+			maxUpdated = tasks[i].UpdatedAt
+		}
+	}
+	return maxUpdated
+}
+
+// advanceSyncTime 计算下一轮轮询的同步水位。
+//
+// 关键：水位必须推进到「本次返回行的最大 updated_at - watchLookback」，而不是 time.Now()。
+// 若用 time.Now()：某行 INSERT 在 SELECT 快照之后才提交，其 updated_at 早于本轮 poll
+// 结束时的 time.Now()，下一轮 `updated_at > lastSync` 就永久漏掉它 → 任务进不了本地缓存，
+// reconcile 每次 lister.Get 落空直接 return，任务被静默丢弃。
+// （场景 C 实测 170 个任务 create 时丢 3 个，正是此竞态。）
+// 空结果时不推进水位（推进到 now 同样会跳过「快照后、now 前」才提交的行）。
+// 水位只前进不回退。
+func advanceSyncTime(prev time.Time, changed []model.Task) time.Time {
+	maxUpdated := maxTaskUpdatedAt(changed)
+	if maxUpdated.IsZero() {
+		return prev
+	}
+	next := maxUpdated.Add(-watchLookback)
+	if next.After(prev) {
+		return next
+	}
+	return prev
+}
+
 // Start 启动 Informer：先 List 全量同步，再后台 Watch 增量。
 func (ti *TaskInformer) Start(ctx context.Context) error {
 	// 1. List 全量同步
@@ -173,15 +214,16 @@ func (ti *TaskInformer) Start(ctx context.Context) error {
 	}
 	slog.Info("informer: initial list synced", "count", len(tasks))
 
-	// 2. 后台 Watch
-	go ti.watchLoop(ctx)
+	// 2. 后台 Watch。初始水位 = List 返回行的最大 updated_at 回退 watchLookback，
+	// 封住「List 快照之后、Watch 启动之前才提交的新行」的 List-Watch 间隙。
+	// （不能用 time.Now()，理由同 advanceSyncTime。）
+	go ti.watchLoop(ctx, advanceSyncTime(time.Time{}, tasks))
 	go ti.dispatchLoop(ctx)
 	return nil
 }
 
 // watchLoop 增量轮询。记录最后同步时间，周期性拉取变更。
-func (ti *TaskInformer) watchLoop(ctx context.Context) {
-	lastSync := time.Now()
+func (ti *TaskInformer) watchLoop(ctx context.Context, lastSync time.Time) {
 	ticker := time.NewTicker(ti.pollInterval)
 	defer ticker.Stop()
 
@@ -195,7 +237,7 @@ func (ti *TaskInformer) watchLoop(ctx context.Context) {
 				slog.Error("informer: watch failed", "err", err)
 				continue
 			}
-			lastSync = time.Now()
+			lastSync = advanceSyncTime(lastSync, changed)
 			ti.applyChanges(changed)
 		}
 	}

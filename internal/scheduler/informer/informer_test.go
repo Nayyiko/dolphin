@@ -114,3 +114,27 @@ func TestInformer_StoreStatusFilter(t *testing.T) {
 		t.Fatalf("expected only a active, got %+v", active)
 	}
 }
+
+func TestAdvanceSyncTime(t *testing.T) {
+	base := time.Now()
+
+	// 空结果：水位不动（若推进到 now，会跳过「快照后、now 前」才提交的行）
+	if got := advanceSyncTime(base, nil); !got.Equal(base) {
+		t.Fatalf("empty: expected %v, got %v", base, got)
+	}
+
+	// 非空：推进到 max(updated_at) - watchLookback
+	t1 := base.Add(2 * time.Second)
+	t2 := base.Add(5 * time.Second)
+	got := advanceSyncTime(base, []model.Task{mkTask("a", t1), mkTask("b", t2)})
+	want := t2.Add(-watchLookback)
+	if !got.Equal(want) {
+		t.Fatalf("expected %v, got %v", want, got)
+	}
+
+	// 不回退：max 落在 lookback 窗口内时，保持原水位
+	got = advanceSyncTime(t2, []model.Task{mkTask("c", t2.Add(100*time.Millisecond))})
+	if !got.Equal(t2) {
+		t.Fatalf("expected no-backward %v, got %v", t2, got)
+	}
+}
