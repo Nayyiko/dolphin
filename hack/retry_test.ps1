@@ -85,6 +85,22 @@ function SqlScalar {
     return $r.ToString().Trim()
 }
 
+# 一次性抓取某端口的 metrics 全文（轮询循环里多次取指标时避免重复 Invoke-WebRequest，
+# Windows 上每次 IWR ~200-300ms，4 次/轮会把 180 轮轮询撑到 ~240s，掩盖真实耗时）。
+function Get-MetricsRaw {
+    param([int]$Port)
+    try { return (Invoke-WebRequest -Uri "http://localhost:$Port/metrics" -UseBasicParsing -TimeoutSec 3).Content }
+    catch { return "" }
+}
+
+# 从 metrics 全文中解析无标签指标值（指标名 + 空格 + 值）。
+function MetricValue {
+    param([string]$Raw, [string]$Name)
+    $line = ($Raw -split "`n") | Where-Object { $_ -match "^$Name " } | Select-Object -First 1
+    if ($line) { return [double](($line -split " ")[1]) }
+    return 0
+}
+
 # MySQL 多行查询（每行按 Tab 拆列）
 function SqlRows {
     param([string]$Q)
@@ -214,19 +230,26 @@ if (-not $SkipPoolFull) {
     $peakQueueC = 0
     $peakInflightC = 0
     $peakUtilC = 0
+    $peakWorkersC = 0
     for ($i = 0; $i -lt $WaitMaxSec * 2; $i++) {
         $okC = [int](SqlScalar "SELECT COUNT(DISTINCT l.task_id) FROM dolphin.task_logs l JOIN tasks t ON t.id=l.task_id WHERE t.name LIKE 'rt-C-%' AND l.status='success';")
-        $eC = Get-Metric $M9091 "dolphin_worker_tasks_executing"
+        # 每个端口只抓一次 metrics，再本地解析各指标（省 3 次 IWR/轮）
+        $raw9091 = Get-MetricsRaw $M9091
+        $raw9090 = Get-MetricsRaw $M9090
+        $eC = MetricValue $raw9091 "dolphin_worker_tasks_executing"
         if ($eC -gt $peakExecC) { $peakExecC = $eC }
         # 调度 WorkQueue 深度：dolphin_scheduler_queue_depth 现在由 Reconciler 真实更新
-        $qC = Get-Metric $M9090 "dolphin_scheduler_queue_depth"
+        $qC = MetricValue $raw9090 "dolphin_scheduler_queue_depth"
         if ($qC -gt $peakQueueC) { $peakQueueC = $qC }
         # worker 池在途数（排队+执行）与利用率：inflight ≈ executing → 下发是涓流，
         # 瓶颈在调度器；inflight 远大于 executing → 任务堵在 worker 队列（突发下发、worker 消化慢）。
-        $iC = Get-Metric $M9091 "dolphin_worker_pool_inflight"
+        $iC = MetricValue $raw9091 "dolphin_worker_pool_inflight"
         if ($iC -gt $peakInflightC) { $peakInflightC = $iC }
-        $uC = Get-Metric $M9091 "dolphin_worker_pool_capacity_utilization"
+        $uC = MetricValue $raw9091 "dolphin_worker_pool_capacity_utilization"
         if ($uC -gt $peakUtilC) { $peakUtilC = $uC }
+        # 在线 worker 数：>1 说明有残留 worker 进程分流了任务（背压打不满的真凶之一）
+        $wC = MetricValue $raw9090 "dolphin_scheduler_workers_online"
+        if ($wC -gt $peakWorkersC) { $peakWorkersC = $wC }
         if ($okC -ge 170) { break }
         Start-Sleep -Milliseconds 500
     }
@@ -250,6 +273,15 @@ if (-not $SkipPoolFull) {
     #    spread ~= 1s → 170 个任务几乎同时下发（突发）→ worker 侧瓶颈/池满背压应触发；
     #    spread ~= elapsed → 下发本身涓流（调度器侧瓶颈），这就是"池满背压够不到"的直接证据。
     $spreadC = [int](SqlScalar "SELECT COALESCE(TIMESTAMPDIFF(SECOND, MIN(start_time), MAX(start_time)), 0) FROM dolphin.task_logs l JOIN tasks t ON t.id=l.task_id WHERE t.name LIKE 'rt-C-%';")
+    # ── 决定性判据：每个任务真实执行时长（end_time - start_time）。
+    #    avg_dur ~= 2s → 执行正常，243s 是轮询循环慢/多 worker 分流的假象；
+    #    avg_dur 几十秒 → 执行本身被拖慢（sleep 端点被争抢/worker 串行），才是真瓶颈。
+    $avgDurC = [int](SqlScalar "SELECT COALESCE(ROUND(AVG(TIMESTAMPDIFF(MILLISECOND, start_time, end_time))/1000, 2), -1) FROM dolphin.task_logs l JOIN tasks t ON t.id=l.task_id WHERE t.name LIKE 'rt-C-%' AND l.end_time IS NOT NULL;")
+    $maxDurC = [int](SqlScalar "SELECT COALESCE(ROUND(MAX(TIMESTAMPDIFF(MILLISECOND, start_time, end_time))/1000, 2), -1) FROM dolphin.task_logs l JOIN tasks t ON t.id=l.task_id WHERE t.name LIKE 'rt-C-%' AND l.end_time IS NOT NULL;")
+    # 结果落库跨度：首个到最后一个结果写入的时差（真实执行时间线，而非下发时间线）
+    $endSpanC = [int](SqlScalar "SELECT COALESCE(TIMESTAMPDIFF(SECOND, MIN(end_time), MAX(end_time)), 0) FROM dolphin.task_logs l JOIN tasks t ON t.id=l.task_id WHERE t.name LIKE 'rt-C-%' AND l.end_time IS NOT NULL;")
+    # 有几个 worker 实际执行了任务（>1 = 残留 worker 进程分流）
+    $distinctWorkerC = [int](SqlScalar "SELECT COUNT(DISTINCT worker_id) FROM dolphin.task_logs l JOIN tasks t ON t.id=l.task_id WHERE t.name LIKE 'rt-C-%';")
     # reconcile 平均耗时：dolphin_scheduler_reconcile_duration_seconds 直方图的 sum/count。
     # 注意是全进程累计（含 A/B/D），但场景 C 占大头；若平均 ~1s+ → DB 查询慢是主因。
     $reconcileSumC = Get-Metric $M9090 "dolphin_scheduler_reconcile_duration_seconds_sum"
@@ -265,10 +297,10 @@ if (-not $SkipPoolFull) {
     $dispatchRateC = "n/a"
     if ($elapsedC -gt 0) { $dispatchRateC = [math]::Round($dispatchDeltaC / $elapsedC, 2) }
     Write-Host "  全部成功用时 ${elapsedC}s；多日志任务数 = $multiC；重试执行日志 = $retryLogC"
-    Write-Host "  诊断：下发计数增量 = $dispatchDeltaC（速率 ${dispatchRateC}/s）；worker 执行峰值 = $peakExecC；worker 在途峰值 = $peakInflightC（排队峰值 ≈ $peakQueuedC）；池利用率峰值 = $peakUtilC；调度队列峰值 = $peakQueueC；无日志任务 = $noLogC"
-    Write-Host "  时间线：下发跨度 = ${spreadC}s（突发≈1s / 涓流≈总时长）；reconcile 平均 = ${reconcileAvgC}s；dispatch Send 平均 = ${dispLatAvgC}s"
-    Add-Content $OutFile "  C 时间线: elapsed=${elapsedC}s spread=${spreadC}s reconcile_avg=${reconcileAvgC}s dispatch_send_avg=${dispLatAvgC}s"
-    Add-Content $OutFile "  C 诊断: dispatch=$dispatchDeltaC(${dispatchRateC}/s) peak_exec=$peakExecC peak_inflight=$peakInflightC peak_queued≈$peakQueuedC peak_util=$peakUtilC peak_queue_depth=$peakQueueC noLog=$noLogC"
+    Write-Host "  诊断：下发计数增量 = $dispatchDeltaC（速率 ${dispatchRateC}/s）；worker 执行峰值 = $peakExecC；worker 在途峰值 = $peakInflightC（排队峰值 ≈ $peakQueuedC）；池利用率峰值 = $peakUtilC；调度队列峰值 = $peakQueueC；在线 worker = $peakWorkersC；无日志任务 = $noLogC"
+    Write-Host "  时间线：下发跨度 = ${spreadC}s；结果落库跨度 = ${endSpanC}s；任务执行时长 平均=${avgDurC}s 最大=${maxDurC}s；reconcile 平均 = ${reconcileAvgC}s；dispatch Send 平均 = ${dispLatAvgC}s；实际执行 worker 数 = $distinctWorkerC"
+    Add-Content $OutFile "  C 时间线: elapsed=${elapsedC}s spread=${spreadC}s end_span=${endSpanC}s task_dur_avg=${avgDurC}s task_dur_max=${maxDurC}s reconcile_avg=${reconcileAvgC}s dispatch_send_avg=${dispLatAvgC}s distinct_workers=$distinctWorkerC"
+    Add-Content $OutFile "  C 诊断: dispatch=$dispatchDeltaC(${dispatchRateC}/s) peak_exec=$peakExecC peak_inflight=$peakInflightC peak_queued≈$peakQueuedC peak_util=$peakUtilC peak_queue_depth=$peakQueueC online_workers=$peakWorkersC noLog=$noLogC"
     Add-Content $OutFile "  C 背压: pool_rejected=$poolRejDeltaC retry_scheduled=$retryDeltaC retry_dispatched=$retryDispDeltaC retry_dispatch_failed=$retryFailDispDeltaC stale=$staleDeltaC multi=$multiC"
     Write-Host "  背压：池满拒绝增量 = $poolRejDeltaC；retry_total scheduled=$retryDeltaC dispatched=$retryDispDeltaC dispatch_failed=$retryFailDispDeltaC；stale 救援 = $staleDeltaC"
     Write-Host "  失败/超时日志 = $failedLogC，按 error_msg 分组："
