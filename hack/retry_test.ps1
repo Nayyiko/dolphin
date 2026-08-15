@@ -217,11 +217,14 @@ if (-not $SkipPoolFull) {
     $poolRejBaseC = Get-Metric $M9091 "dolphin_worker_pool_rejected_total"
     $staleBaseC = Get-Metric $M9090 "dolphin_scheduler_stale_running_rescued_total"
     $startC = Get-Date
-    & "$Bins\dolphinctl.exe" --addr $SCHED stress create --count 170 --prefix "rt-C" --cron "0 0 1 1 *" --handler "http://localhost:9090/debug/sleep?seconds=2" --timeout 10 --retries 3 2>&1 | Out-Null
+    & "$Bins\dolphinctl.exe" --addr $SCHED stress create --count 170 --prefix "rt-C" --cron "0 0 1 1 *" --handler "http://localhost:9090/debug/sleep?seconds=5" --timeout 10 --retries 3 2>&1 | Out-Null
     # 收集 id：不能用 GROUP_CONCAT（默认 group_concat_max_len=1024，170 个 UUID
     # ~6300 字符会被截断，导致只触发前 ~27 个，多任务场景全变假）。逐行取再 join。
     $idsC = ((SqlRows "SELECT id FROM dolphin.tasks WHERE name LIKE 'rt-C-%';") -join ",")
-    Write-Host "  创建 170 个 sleep(2s) 任务，触发全部（实际 id 数 = $(($idsC -split ',').Count)）"
+    # sleep 5s > 实测下发跨度 3s：170 个任务全部到达后第一批才完成（t=5s），
+    # 在途必然冲顶 150 上限 → ~20 个 Submit 被拒 → 触发背压自动重试（这才是场景 C 的本意）。
+    # 之前 sleep 2s 时首批 50 个 t=2s 就完成释放槽位，在途峰值只有 136<150，0 拒绝。
+    Write-Host "  创建 170 个 sleep(5s) 任务（>下发跨度 3s，强制溢出 150 在途上限），触发全部（实际 id 数 = $(($idsC -split ',').Count)）"
     $trigOut = & "$Bins\dolphinctl.exe" --addr $SCHED task trigger-batch --ids $idsC 2>&1
     Write-Host "  trigger-batch: $($trigOut -join ' ')"
 
