@@ -242,6 +242,16 @@ var (
 		[]string{"status"}, // success/failed/timeout/cancelled
 	)
 
+	// 池满拒绝计数：Submit 因队列满被拒（主动背压）的次数。
+	// 场景 C（池满自动重试）用它直测背压是否真实发生：
+	// 调度器把这些任务标 failed → 自动重试 → 新实例执行成功。
+	WorkerPoolRejectedTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "dolphin_worker_pool_rejected_total",
+			Help: "Total number of dispatches rejected because the worker pool was full (active backpressure).",
+		},
+	)
+
 	// Worker 协程池利用率
 	WorkerPoolUtilization = promauto.NewGauge(
 		prometheus.GaugeOpts{
@@ -360,4 +370,9 @@ func RecordWorkerTaskCompleted(handlerType string, duration time.Duration, statu
 	WorkerTasksExecuting.Dec()
 	WorkerTaskDuration.WithLabelValues(handlerType).Observe(duration.Seconds())
 	WorkerTaskCompleted.WithLabelValues(status).Inc()
+}
+
+// RecordPoolRejected worker 协程池满、拒绝一次下发（主动背压）。
+func RecordPoolRejected() {
+	WorkerPoolRejectedTotal.Inc()
 }

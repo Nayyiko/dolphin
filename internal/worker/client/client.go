@@ -12,6 +12,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/yourname/dolphin/api/proto/pb"
+	"github.com/yourname/dolphin/internal/pkg/metrics"
+	"github.com/yourname/dolphin/internal/pkg/ratelog"
 	"github.com/yourname/dolphin/internal/worker/executor"
 )
 
@@ -55,6 +57,10 @@ type Client struct {
 	// 发送失败（断线/Leader 切换）时退避重试，保证结果不因瞬时连接抖动丢失。
 	// 容量足够容纳在途上限（capacity + capacity*2）。
 	resultCh chan *executor.TaskResult
+
+	// rejectLog 池满拒绝日志限频器。handleDispatch 在 worker 的 recv 循环里，
+	// 对每条拒绝同步写控制台会阻塞 recvLoop → 停止 Recv 下发 → 拖垮调度。
+	rejectLog *ratelog.Logger
 }
 
 // Config Worker 客户端配置。
@@ -83,6 +89,7 @@ func New(cfg Config, pool *executor.Pool) (*Client, error) {
 		maxConc:     cfg.MaxConcurrency,
 		reconnectCh: make(chan struct{}, 1),
 		resultCh:    make(chan *executor.TaskResult, 256),
+		rejectLog:   ratelog.New(500 * time.Millisecond),
 	}, nil
 }
 
@@ -320,7 +327,9 @@ func (c *Client) handleDispatch(d *pb.TaskDispatch) {
 		Timeout:     int(d.Timeout),
 	})
 	if !accepted {
-		slog.Warn("pool full, rejecting task", "instance_id", d.InstanceId)
+		// 队列满：立即上报失败，让调度器分给其他 Worker 或重试。
+		metrics.RecordPoolRejected()
+		c.rejectLog.Warn("pool full, rejecting task (rate-limited)", "instance_id", d.InstanceId)
 		// 队列满：立即上报失败，让调度器分给其他 Worker 或重试
 		c.sendMu.Lock()
 		if c.stream != nil {

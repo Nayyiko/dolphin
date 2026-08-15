@@ -62,6 +62,21 @@ function Get-RetryMetric {
     } catch { return -1 }
 }
 
+# 读带 handler_type/result 标签的下发计数器（CounterVec），跨 result 求和。
+# 不能用 Get-Metric：它只匹配"指标名 + 空格"的采样行，而标签化行长这样：
+#   dolphin_scheduler_dispatch_total{handler_type="http",result="success"} 170
+# 裸指标名行不存在 → 之前"下发增量 = 0/170"是脚本读取 bug，不是真实下发为零。
+function Get-DispatchMetric {
+    param([int]$Port)
+    try {
+        $m = (Invoke-WebRequest -Uri "http://localhost:$Port/metrics" -UseBasicParsing -TimeoutSec 3).Content
+        $total = 0.0
+        $lines = $m -split "`n" | Where-Object { $_ -match '^dolphin_scheduler_dispatch_total\{' }
+        foreach ($l in $lines) { $total += [double](($l -split " ")[1]) }
+        return $total
+    } catch { return -1 }
+}
+
 # MySQL 单值查询（去掉末尾换行）
 function SqlScalar {
     param([string]$Q)
@@ -180,7 +195,11 @@ Write-Result ($retryDeltaB -ge 1) "retry_total{result=scheduled} 增量 = $retry
 if (-not $SkipPoolFull) {
     Write-Step "C. 池满背压自动重试：170 任务 > 在途上限 150，超出部分自动重试直到成功"
     $retryBaseC = Get-RetryMetric $M9090 "scheduled"
-    $dispatchBaseC = Get-Metric $M9090 "dolphin_scheduler_dispatch_total"
+    $retryDispBaseC = Get-RetryMetric $M9090 "dispatched"
+    $retryFailDispBaseC = Get-RetryMetric $M9090 "dispatch_failed"
+    $dispatchBaseC = Get-DispatchMetric $M9090
+    $poolRejBaseC = Get-Metric $M9091 "dolphin_worker_pool_rejected_total"
+    $staleBaseC = Get-Metric $M9090 "dolphin_scheduler_stale_running_rescued_total"
     $startC = Get-Date
     & "$Bins\dolphinctl.exe" --addr $SCHED stress create --count 170 --prefix "rt-C" --cron "0 0 1 1 *" --handler "http://localhost:9090/debug/sleep?seconds=2" --timeout 10 --retries 3 2>&1 | Out-Null
     # 收集 id：不能用 GROUP_CONCAT（默认 group_concat_max_len=1024，170 个 UUID
@@ -192,29 +211,45 @@ if (-not $SkipPoolFull) {
 
     $okC = 0
     $peakExecC = 0
+    $peakQueueC = 0
     for ($i = 0; $i -lt $WaitMaxSec * 2; $i++) {
         $okC = [int](SqlScalar "SELECT COUNT(DISTINCT l.task_id) FROM dolphin.task_logs l JOIN tasks t ON t.id=l.task_id WHERE t.name LIKE 'rt-C-%' AND l.status='success';")
         $eC = Get-Metric $M9091 "dolphin_worker_tasks_executing"
         if ($eC -gt $peakExecC) { $peakExecC = $eC }
+        $qC = Get-Metric $M9090 "dolphin_scheduler_queue_depth"
+        if ($qC -gt $peakQueueC) { $peakQueueC = $qC }
         if ($okC -ge 170) { break }
         Start-Sleep -Milliseconds 500
     }
     $elapsedC = [math]::Round(((Get-Date) - $startC).TotalSeconds, 1)
     $multiC = [int](SqlScalar "SELECT COUNT(*) FROM tasks t WHERE t.name LIKE 'rt-C-%' AND (SELECT COUNT(*) FROM task_logs WHERE task_id=t.id) > 1;")
     $retryDeltaC = (Get-RetryMetric $M9090 "scheduled") - $retryBaseC
-    $dispatchDeltaC = (Get-Metric $M9090 "dolphin_scheduler_dispatch_total") - $dispatchBaseC
+    $retryDispDeltaC = (Get-RetryMetric $M9090 "dispatched") - $retryDispBaseC
+    $retryFailDispDeltaC = (Get-RetryMetric $M9090 "dispatch_failed") - $retryFailDispBaseC
+    $dispatchDeltaC = (Get-DispatchMetric $M9090) - $dispatchBaseC
+    $poolRejDeltaC = (Get-Metric $M9091 "dolphin_worker_pool_rejected_total") - $poolRejBaseC
+    $staleDeltaC = (Get-Metric $M9090 "dolphin_scheduler_stale_running_rescued_total") - $staleBaseC
     # 没有任何 task_log 的任务数：reconcile 没下发成功（之前 workqueue Done 泄漏时
     # reconcile 出错会让任务永久卡死、连日志都不建），应为 0。
     $noLogC = [int](SqlScalar "SELECT COUNT(*) FROM tasks t WHERE t.name LIKE 'rt-C-%' AND NOT EXISTS (SELECT 1 FROM task_logs l WHERE l.task_id = t.id);")
     # 失败的任务（最新日志非 success）应为 0
     $notDoneC = [int](SqlScalar "SELECT COUNT(*) FROM tasks t WHERE t.name LIKE 'rt-C-%' AND (SELECT status FROM task_logs WHERE task_id=t.id ORDER BY created_at DESC LIMIT 1) <> 'success';")
-    Write-Host "  全部成功用时 ${elapsedC}s；重试任务数 = $multiC；retry_total 增量 = $retryDeltaC"
-    Write-Host "  诊断：下发增量 = $dispatchDeltaC/170；worker 执行峰值 = $peakExecC；无日志任务 = $noLogC"
+    # 失败/超时日志总数 + 重试执行日志数（retry_count>=1）
+    $failedLogC = [int](SqlScalar "SELECT COUNT(*) FROM dolphin.task_logs l JOIN tasks t ON t.id=l.task_id WHERE t.name LIKE 'rt-C-%' AND l.status IN ('failed','timeout');")
+    $retryLogC = [int](SqlScalar "SELECT COUNT(*) FROM dolphin.task_logs l JOIN tasks t ON t.id=l.task_id WHERE t.name LIKE 'rt-C-%' AND l.retry_count >= 1;")
+    Write-Host "  全部成功用时 ${elapsedC}s；多日志任务数 = $multiC；重试执行日志 = $retryLogC"
+    Write-Host "  诊断：下发计数增量 = $dispatchDeltaC；worker 执行峰值 = $peakExecC；调度队列峰值 = $peakQueueC；无日志任务 = $noLogC"
+    Write-Host "  背压：池满拒绝增量 = $poolRejDeltaC；retry_total scheduled=$retryDeltaC dispatched=$retryDispDeltaC dispatch_failed=$retryFailDispDeltaC；stale 救援 = $staleDeltaC"
+    Write-Host "  失败/超时日志 = $failedLogC，按 error_msg 分组："
+    $errRows = SqlRows "SELECT l.error_msg, COUNT(*) FROM dolphin.task_logs l JOIN tasks t ON t.id=l.task_id WHERE t.name LIKE 'rt-C-%' AND l.status IN ('failed','timeout') GROUP BY l.error_msg;"
+    foreach ($er in $errRows) { if ($er) { Write-Host "    $($er -replace "`t", "  ")"; Add-Content $OutFile "  err: $($er -replace "`t", "  ")" } }
     Write-Result ($okC -ge 170) "170 个任务全部最终 success"
     Write-Result ($notDoneC -eq 0) "最新日志全部为 success（无残留失败）"
     Write-Result ($noLogC -eq 0) "无日志任务 = $noLogC（期望 0，无任务卡死在调度队列）"
-    Write-Result ($multiC -gt 0) "$multiC 个任务经历过重试（池满被拒后自动重试，而非等 cron）"
-    Write-Result ($retryDeltaC -ge 1) "retry_total{result=scheduled} 增量 = $retryDeltaC"
+    Write-Result ($poolRejDeltaC -ge 1) "池满拒绝增量 = $poolRejDeltaC（期望 >= 1，背压真实发生）"
+    Write-Result ($retryDeltaC -ge $poolRejDeltaC) "retry_total{scheduled} 增量 = $retryDeltaC（期望 >= 拒绝数 $poolRejDeltaC，每个被拒任务都安排重试）"
+    Write-Result ($retryDispDeltaC -ge $poolRejDeltaC) "retry_total{dispatched} 增量 = $retryDispDeltaC（期望 >= 拒绝数 $poolRejDeltaC，重试真正下发执行）"
+    Write-Result ($multiC -ge $poolRejDeltaC) "$multiC 个任务有过重试日志（期望 >= 拒绝数 $poolRejDeltaC）"
 } else {
     Write-Step "C. 池满背压自动重试（已跳过 -SkipPoolFull）"
     Add-Content $OutFile "SKIP: pool full scenario"

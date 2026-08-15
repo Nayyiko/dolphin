@@ -12,7 +12,13 @@ import (
 	"time"
 
 	"github.com/yourname/dolphin/internal/pkg/metrics"
+	"github.com/yourname/dolphin/internal/pkg/ratelog"
 )
+
+// resultLog 结果日志限频器。report 在 pool worker goroutine 里执行，
+// 每个任务一条 slog 会让 50 个池槽位在写慢速 Windows 控制台时互相阻塞，
+// 降低执行吞吐。完整状态在 task_logs，限频不影响排障。
+var resultLog = ratelog.New(500 * time.Millisecond)
 
 // TaskDispatch 下发的任务。
 type TaskDispatch struct {
@@ -142,7 +148,7 @@ func (p *Pool) report(ctx context.Context, r *TaskResult) {
 	if p.reporter == nil {
 		return
 	}
-	slog.Info("task result", "instance_id", r.InstanceID, "status", r.Status)
+	resultLog.Info("task result (rate-limited)", "instance_id", r.InstanceID, "status", r.Status)
 	if err := p.reporter.ReportResult(ctx, r); err != nil {
 		slog.Warn("failed to report result", "instance_id", r.InstanceID, "err", err)
 	}

@@ -16,6 +16,7 @@ import (
 	"github.com/yourname/dolphin/api/proto/pb"
 	"github.com/yourname/dolphin/internal/pkg/metrics"
 	"github.com/yourname/dolphin/internal/pkg/model"
+	"github.com/yourname/dolphin/internal/pkg/ratelog"
 	"github.com/yourname/dolphin/internal/scheduler/dag"
 	"github.com/yourname/dolphin/internal/scheduler/manager"
 )
@@ -35,6 +36,11 @@ type SchedulerService struct {
 	workers map[string]*workerConn
 	// dispatchCh: 待下发的任务（由 Reconciler 写入）
 	dispatchCh chan *pb.TaskDispatch
+
+	// resultLog 结果日志限频器。connect 的 recv 循环是单 goroutine，
+	// 若对每条 TaskResult 同步 slog 写慢速 Windows 控制台，170 条结果
+	// 会把结果落库拖到 ~180s（实测）。限频后恢复秒级，见 internal/pkg/ratelog。
+	resultLog *ratelog.Logger
 }
 
 type workerConn struct {
@@ -52,6 +58,7 @@ func NewSchedulerService(mgr *manager.Manager) *SchedulerService {
 		manager:    mgr,
 		workers:    make(map[string]*workerConn),
 		dispatchCh: make(chan *pb.TaskDispatch, 1024),
+		resultLog:  ratelog.New(500 * time.Millisecond),
 	}
 }
 
@@ -199,7 +206,12 @@ func (s *SchedulerService) updateWorkerHeartbeat(ctx context.Context, hb *pb.Hea
 // handleTaskResult 处理任务执行结果，更新 task_log。
 func (s *SchedulerService) handleTaskResult(ctx context.Context, r *pb.TaskResult) {
 	db := s.manager.DB()
-	slog.Info("task result received", "instance_id", r.InstanceId, "status", r.Status)
+	// 限频采样日志：这条在 Connect 的 recv 循环（单 goroutine）里执行，
+	// 高吞吐下每结果同步写慢速 Windows 控制台会阻塞 recv 循环，把结果落库
+	// 拖慢两个数量级（实测 170 结果 ~180s）。限频后不影响排障——完整
+	// 状态在 task_logs，重试路径另有 "execution retry scheduled" 日志。
+	s.resultLog.Info("task result received (rate-limited)",
+		"instance_id", r.InstanceId, "status", r.Status)
 
 	updates := map[string]any{
 		"status": r.Status,
