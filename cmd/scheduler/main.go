@@ -43,6 +43,10 @@ var (
 	GitCommit = "unknown"
 )
 
+// failCounts 记录 /debug/fail 每个路径已合成的失败次数（并发安全），
+// 用于测试"前 N 次失败、之后成功"的执行级重试路径。
+var failCounts sync.Map // map[string]int
+
 func main() {
 	slog.Info("dolphin scheduler starting",
 		"version", Version,
@@ -141,9 +145,9 @@ func main() {
 	// Informer 事件 → 入队
 	inf.AddEventHandler(eventHandler{recon: recon})
 
-	// DAG 事件驱动：上游任务结果到达 → 推送下游任务重新检查依赖（毫秒级唤醒）。
-	svc.SetOnTaskResult(func(taskID string) {
-		recon.EnqueueDependents(taskID)
+	// DAG 事件驱动 + 执行级重试：任务结果到达 → 推送下游 + 失败自动重试。
+	svc.SetOnTaskResult(func(taskID, status string) {
+		recon.OnTaskResult(taskID, status)
 	})
 
 	// 启动 Reconciler（仅在当前节点是 Leader 时运行核心调度）
@@ -194,6 +198,20 @@ func main() {
 			heartbeatTimeout = 30 * time.Second
 		}
 		go recon.RunWorkerMonitor(lctx, heartbeatTimeout, 5*time.Second)
+
+		// 执行级重试：把 Leader ctx 注入 Reconciler（失权时重试定时器随之下线），
+		// 配置退避基线与 stale running 兜底阈值。
+		recon.SetLeaderCtx(lctx)
+		retryBase := cfg.Failover.RetryBaseDelay
+		if retryBase <= 0 {
+			retryBase = 2 * time.Second
+		}
+		recon.SetRetryPolicy(retryBase)
+		staleGrace := cfg.Failover.StaleRunningGrace
+		if staleGrace <= 0 {
+			staleGrace = 30 * time.Second
+		}
+		go recon.RunStaleRunningScanner(lctx, 5*time.Second, staleGrace)
 
 		// 将本实例的 gRPC 地址发布到 etcd，并绑定到选主 lease。
 		// 立即发布一次 + 每 5s 重发布：
@@ -292,6 +310,24 @@ func main() {
 				}
 				w.WriteHeader(http.StatusOK)
 				_, _ = w.Write([]byte(fmt.Sprintf("slept %ds", secs)))
+			case "/debug/fail":
+				// 调试用失败端点：返回 500，用于验证执行级重试
+				// （worker 执行到 HTTP >= 400 判失败 → 触发重试直到 max_retries 耗尽）。
+				// ?times=N 可选：前 N 次失败、之后成功（验证"重试后最终成功"路径）。
+				times, _ := strconv.Atoi(r.URL.Query().Get("times"))
+				if times <= 0 {
+					times = 1 << 30 // 一直失败
+				}
+				cntAny, _ := failCounts.LoadOrStore(r.URL.RequestURI(), 0)
+				cnt := cntAny.(int)
+				if cnt < times {
+					failCounts.Store(r.URL.RequestURI(), cnt+1)
+					w.WriteHeader(http.StatusInternalServerError)
+					_, _ = w.Write([]byte(fmt.Sprintf("synthetic failure #%d", cnt+1)))
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("recovered"))
 			default:
 				http.NotFound(w, r)
 			}

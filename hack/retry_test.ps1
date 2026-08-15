@@ -1,0 +1,217 @@
+﻿# retry_test.ps1 — 执行可靠性增强验证脚本
+#
+# 回答面试问题："不用 MQ 这类中间件，会不会丢消息？"
+# 本脚本给出四个可复现的硬数据证据，验证执行可靠性三件套：
+#   A. 执行级重试：失败 → 指数退避自动重试 → 重试耗尽标记 RetriesExhausted
+#   B. 重试后最终成功：前 N 次失败、之后成功（验证重试不是"无限重试"）
+#   C. 池满背压自动重试：超出 worker 在途上限的任务不再等下一个 cron，
+#      自动重试直到成功（对比之前：只能等 cron 或手动触发）
+#   D. stale-running 兜底救援：结果上报丢失/worker 挂死 → 扫描器救援 + 重试
+#
+# 用法:
+#   powershell -ExecutionPolicy Bypass -File hack\retry_test.ps1            # 全跑
+#   powershell -ExecutionPolicy Bypass -File hack\retry_test.ps1 -SkipPoolFull  # 跳过最耗时的 C
+#
+# 前置（与 schedule_concurrency_test.ps1 相同）:
+#   docker compose -f deployments/docker-compose.yaml up -d etcd mysql redis
+#   go build -o bin\scheduler.exe ./cmd/scheduler && go build -o bin\worker.exe ./cmd/worker && go build -o bin\dolphinctl.exe ./cmd/dolphinctl
+#   start-dev.ps1 启动 1 个 scheduler（metrics 9090 / grpc 50051）+ 1 个 worker（metrics 9091）
+#
+# 输出: results\retry_report.txt
+
+param(
+    [switch]$SkipPoolFull,      # 跳过场景 C（池满自动重试）
+    [int]$WaitMaxSec = 90       # 单场景最长等待
+)
+
+$ErrorActionPreference = "Continue"
+$ProjectDir = "C:\Users\30641\Desktop\dolphin"
+$Bins = "$ProjectDir\bin"
+$Results = "$ProjectDir\results"
+New-Item -ItemType Directory -Force -Path $Results | Out-Null
+$OutFile = "$Results\retry_report.txt"
+"" | Set-Content $OutFile
+
+$SCHED = "localhost:50051"   # gRPC
+$M9090 = 9090                # scheduler metrics
+$M9091 = 9091                # worker metrics
+
+function Write-Step { param($msg) Write-Host "`n══════════ $msg ══════════" -ForegroundColor Green; Add-Content $OutFile "`n== $msg ==" }
+function Write-Result { param($ok, $msg) if ($ok) { Write-Host "  ✅ $msg" -ForegroundColor Green; Add-Content $OutFile "PASS: $msg" } else { Write-Host "  ❌ $msg" -ForegroundColor Red; Add-Content $OutFile "FAIL: $msg" } }
+
+# 读无标签指标（只匹配"指标名 + 空格 + 值"的采样行，避开 # HELP/# TYPE）
+function Get-Metric {
+    param([int]$Port, [string]$Name)
+    try {
+        $m = (Invoke-WebRequest -Uri "http://localhost:$Port/metrics" -UseBasicParsing -TimeoutSec 3).Content
+        $line = ($m -split "`n") | Where-Object { $_ -match "^$Name " } | Select-Object -First 1
+        if ($line) { return [double](($line -split " ")[1]) }
+        return 0
+    } catch { return -1 }
+}
+
+# 读带 result 标签的指标，如 dolphin_scheduler_retry_total{result="scheduled"}
+function Get-RetryMetric {
+    param([int]$Port, [string]$Result)
+    try {
+        $m = (Invoke-WebRequest -Uri "http://localhost:$Port/metrics" -UseBasicParsing -TimeoutSec 3).Content
+        $pat = '^dolphin_scheduler_retry_total{result="' + $Result + '"} '
+        $line = ($m -split "`n") | Where-Object { $_ -match $pat } | Select-Object -First 1
+        if ($line) { return [double](($line -split " ")[1]) }
+        return 0
+    } catch { return -1 }
+}
+
+# MySQL 单值查询（去掉末尾换行）
+function SqlScalar {
+    param([string]$Q)
+    $r = docker exec dolphin-mysql mysql -u root -pdolphin -N -e $Q 2>$null
+    if ($null -eq $r) { return "" }
+    return $r.ToString().Trim()
+}
+
+# MySQL 多行查询（每行按 Tab 拆列）
+function SqlRows {
+    param([string]$Q)
+    $r = docker exec dolphin-mysql mysql -u root -pdolphin -N -e $Q 2>$null
+    return $r
+}
+
+function Wait-Healthz($port, $maxSec) {
+    for ($i = 0; $i -lt $maxSec; $i++) {
+        try { $null = Invoke-WebRequest -Uri "http://localhost:$port/healthz" -UseBasicParsing -TimeoutSec 2; return $true } catch {}
+        Start-Sleep 1
+    }
+    return $false
+}
+
+# 创建任务并返回 id（name 唯一）
+function New-Task {
+    param([string]$Name, [string]$Handler, [int]$Timeout, [int]$Retries)
+    & "$Bins\dolphinctl.exe" --addr $SCHED task create --name $Name --cron "0 0 1 1 *" --handler $Handler --timeout $Timeout --retries $Retries 2>&1 | Out-Null
+    return (SqlScalar "SELECT id FROM dolphin.tasks WHERE name='$Name' LIMIT 1;")
+}
+
+# ---------- 0. 前置检查 ----------
+Write-Step "0. 前置检查"
+if (-not (Wait-Healthz $M9090 5)) { Write-Host "❌ scheduler 未就绪（9090 无 /healthz）" -ForegroundColor Red; exit 1 }
+if (-not (Wait-Healthz $M9091 5)) { Write-Host "❌ worker 未就绪（9091 无 /healthz）" -ForegroundColor Red; exit 1 }
+
+Write-Step "0. 清理旧数据"
+docker exec dolphin-mysql mysql -u root -pdolphin -e "USE dolphin; DELETE FROM task_conditions; DELETE FROM task_logs; DELETE FROM tasks;" 2>$null
+Write-Host "已清理 tasks / task_logs / task_conditions"
+
+# ---------- 场景 A：失败 → 自动重试 → 耗尽 ----------
+Write-Step "A. 执行级重试：持续失败 → 指数退避重试 → RetriesExhausted"
+$retryBase = Get-RetryMetric $M9090 "scheduled"
+$exhBase = Get-RetryMetric $M9090 "exhausted"
+$idA = New-Task "rt-A" "http://localhost:9090/debug/fail" 30 2
+if (-not $idA) { Write-Host "❌ rt-A 创建失败" -ForegroundColor Red; exit 1 }
+& "$Bins\dolphinctl.exe" --addr $SCHED task trigger --id $idA | Out-Null
+Write-Host "  rt-A id=$idA 已触发（max_retries=2，期望 3 次尝试全部失败后耗尽）"
+
+$termA = 0
+for ($i = 0; $i -lt $WaitMaxSec * 2; $i++) {
+    $termA = [int](SqlScalar "SELECT COUNT(*) FROM dolphin.task_logs WHERE task_id='$idA' AND status IN ('success','failed','timeout');")
+    if ($termA -ge 3) { break }
+    Start-Sleep -Milliseconds 500
+}
+Start-Sleep 1  # 等耗尽条件落库
+$logsA = SqlRows "SELECT retry_count, status, error_msg FROM dolphin.task_logs WHERE task_id='$idA' ORDER BY created_at ASC;"
+Write-Host "  task_logs (retry_count,status,error):"
+foreach ($l in $logsA) { if ($l) { Write-Host "    $($l -replace "`t", "  ")"; Add-Content $OutFile "  log: $($l -replace "`t", "  ")" } }
+$condA = SqlScalar "SELECT CONCAT(status,'/',reason) FROM dolphin.task_conditions WHERE task_id='$idA' AND type='Retries';"
+Write-Host "  Condition Retries = $condA"
+
+$retryDeltaA = (Get-RetryMetric $M9090 "scheduled") - $retryBase
+$exhDeltaA = (Get-RetryMetric $M9090 "exhausted") - $exhBase
+Write-Result ($termA -ge 3) "共 3 次尝试（首次 + 2 次重试）"
+Write-Result ($retryDeltaA -ge 2) "retry_total{result=scheduled} 增量 = $retryDeltaA（期望 >= 2）"
+Write-Result ($exhDeltaA -ge 1) "retry_total{result=exhausted} 增量 = $exhDeltaA（期望 >= 1）"
+Write-Result ($condA -match "False/RetriesExhausted") "Condition Retries = $condA（期望 False/RetriesExhausted）"
+
+# ---------- 场景 B：前 N 次失败、之后成功 ----------
+Write-Step "B. 执行级重试：前 2 次失败、之后成功（重试是『有限且能恢复』的）"
+$retryBaseB = Get-RetryMetric $M9090 "scheduled"
+$idB = New-Task "rt-B" "http://localhost:9090/debug/fail?times=2" 30 3
+if (-not $idB) { Write-Host "❌ rt-B 创建失败" -ForegroundColor Red; exit 1 }
+& "$Bins\dolphinctl.exe" --addr $SCHED task trigger --id $idB | Out-Null
+Write-Host "  rt-B id=$idB 已触发（times=2：前两次失败，第 3 次成功）"
+
+$termB = 0
+for ($i = 0; $i -lt $WaitMaxSec * 2; $i++) {
+    $termB = [int](SqlScalar "SELECT COUNT(*) FROM dolphin.task_logs WHERE task_id='$idB' AND status IN ('success','failed','timeout');")
+    if ($termB -ge 3) { break }
+    Start-Sleep -Milliseconds 500
+}
+$logsB = SqlRows "SELECT retry_count, status FROM dolphin.task_logs WHERE task_id='$idB' ORDER BY created_at ASC;"
+foreach ($l in $logsB) { if ($l) { Write-Host "    $($l -replace "`t", "  ")"; Add-Content $OutFile "  log: $($l -replace "`t", "  ")" } }
+$succB = [int](SqlScalar "SELECT COUNT(*) FROM dolphin.task_logs WHERE task_id='$idB' AND status='success';")
+$exhB = [int](SqlScalar "SELECT COUNT(*) FROM dolphin.task_conditions WHERE task_id='$idB' AND type='Retries';")
+$retryDeltaB = (Get-RetryMetric $M9090 "scheduled") - $retryBaseB
+Write-Result ($termB -ge 3 -and $succB -eq 1) "3 次尝试，最终 1 次成功"
+Write-Result ($exhB -eq 0) "未触发 RetriesExhausted（期望 0 条耗尽条件）"
+Write-Result ($retryDeltaB -ge 1) "retry_total{result=scheduled} 增量 = $retryDeltaB（期望 >= 1）"
+
+# ---------- 场景 C：池满背压 → 自动重试直到成功 ----------
+if (-not $SkipPoolFull) {
+    Write-Step "C. 池满背压自动重试：170 任务 > 在途上限 150，超出部分自动重试直到成功"
+    $retryBaseC = Get-RetryMetric $M9090 "scheduled"
+    $startC = Get-Date
+    & "$Bins\dolphinctl.exe" --addr $SCHED stress create --count 170 --prefix "rt-C" --cron "0 0 1 1 *" --handler "http://localhost:9090/debug/sleep?seconds=2" --timeout 10 --retries 3 2>&1 | Out-Null
+    $idsC = SqlScalar "SELECT GROUP_CONCAT(id) FROM dolphin.tasks WHERE name LIKE 'rt-C-%';"
+    Write-Host "  创建 170 个 sleep(2s) 任务，触发全部"
+    & "$Bins\dolphinctl.exe" --addr $SCHED task trigger-batch --ids $idsC 2>&1 | Out-Null
+
+    $okC = 0
+    for ($i = 0; $i -lt $WaitMaxSec * 2; $i++) {
+        $okC = [int](SqlScalar "SELECT COUNT(DISTINCT l.task_id) FROM dolphin.task_logs l JOIN tasks t ON t.id=l.task_id WHERE t.name LIKE 'rt-C-%' AND l.status='success';")
+        if ($okC -ge 170) { break }
+        Start-Sleep -Milliseconds 500
+    }
+    $elapsedC = [math]::Round(((Get-Date) - $startC).TotalSeconds, 1)
+    $multiC = [int](SqlScalar "SELECT COUNT(*) FROM tasks t WHERE t.name LIKE 'rt-C-%' AND (SELECT COUNT(*) FROM task_logs WHERE task_id=t.id) > 1;")
+    $retryDeltaC = (Get-RetryMetric $M9090 "scheduled") - $retryBaseC
+    # 失败的任务（最新日志非 success）应为 0
+    $notDoneC = [int](SqlScalar "SELECT COUNT(*) FROM tasks t WHERE t.name LIKE 'rt-C-%' AND (SELECT status FROM task_logs WHERE task_id=t.id ORDER BY created_at DESC LIMIT 1) <> 'success';")
+    Write-Host "  全部成功用时 ${elapsedC}s；重试任务数 = $multiC；retry_total 增量 = $retryDeltaC"
+    Write-Result ($okC -ge 170) "170 个任务全部最终 success"
+    Write-Result ($notDoneC -eq 0) "最新日志全部为 success（无残留失败）"
+    Write-Result ($multiC -gt 0) "$multiC 个任务经历过重试（池满被拒后自动重试，而非等 cron）"
+    Write-Result ($retryDeltaC -ge 1) "retry_total{result=scheduled} 增量 = $retryDeltaC"
+} else {
+    Write-Step "C. 池满背压自动重试（已跳过 -SkipPoolFull）"
+    Add-Content $OutFile "SKIP: pool full scenario"
+}
+
+# ---------- 场景 D：stale-running 兜底救援 ----------
+Write-Step "D. stale-running 兜底救援：结果上报丢失 → 扫描器标记失败并重试"
+$rescueBase = Get-Metric $M9090 "dolphin_scheduler_stale_running_rescued_total"
+$idD = New-Task "rt-D" "http://localhost:9090/debug/sleep?seconds=1" 30 2
+if (-not $idD) { Write-Host "❌ rt-D 创建失败" -ForegroundColor Red; exit 1 }
+# 手工插入一条"结果上报丢失"的 running 日志：start_time 已超 timeout(30)+grace(30)+1s
+docker exec dolphin-mysql mysql -u root -pdolphin -e "USE dolphin; INSERT INTO task_logs (id, task_id, instance_id, worker_id, status, start_time, created_at, retry_count) VALUES ('stale-0001', '$idD', 'stale-inst-0001', 'ghost-worker', 'running', NOW() - INTERVAL 61 SECOND, NOW() - INTERVAL 61 SECOND, 0);" 2>$null
+Write-Host "  已插入 fake running 日志（start_time = now - 61s > timeout 30 + grace 30），等扫描器（5s 周期）救援"
+
+$rescuedD = 0
+$fakeFailed = 0
+$retryLogD = 0
+$succD = 0
+for ($i = 0; $i -lt $WaitMaxSec * 2; $i++) {
+    $rescuedD = [int]((Get-Metric $M9090 "dolphin_scheduler_stale_running_rescued_total") - $rescueBase)
+    $fakeFailed = [int](SqlScalar "SELECT COUNT(*) FROM dolphin.task_logs WHERE id='stale-0001' AND status='failed' AND error_msg LIKE 'stale running%';")
+    $retryLogD = [int](SqlScalar "SELECT COUNT(*) FROM dolphin.task_logs WHERE task_id='$idD' AND retry_count >= 1;")
+    $succD = [int](SqlScalar "SELECT COUNT(*) FROM dolphin.task_logs WHERE task_id='$idD' AND status='success';")
+    if ($rescuedD -ge 1 -and $fakeFailed -ge 1 -and $retryLogD -ge 1) { break }
+    Start-Sleep -Milliseconds 500
+}
+$fakeErrD = SqlScalar "SELECT error_msg FROM dolphin.task_logs WHERE id='stale-0001';"
+Write-Host "  救援计数增量 = $rescuedD；fake log = failed($fakeFailed)；重试日志 = $retryLogD；成功 = $succD"
+Write-Host "  fake log error: $fakeErrD"
+Write-Result ($rescuedD -ge 1) "stale_running_rescued_total 增量 = $rescuedD（期望 >= 1）"
+Write-Result ($fakeFailed -ge 1) "幻影 running 日志被置为 failed"
+Write-Result ($retryLogD -ge 1 -and $succD -ge 1) "救援后自动重试并成功（重试日志 $retryLogD，成功 $succD）"
+
+# ---------- 汇总 ----------
+Write-Step "结果已写入 $OutFile"
+Get-Content $OutFile

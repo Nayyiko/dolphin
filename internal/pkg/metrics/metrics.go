@@ -183,6 +183,31 @@ var (
 			Help: "Total number of DAG create/update attempts rejected due to a cycle.",
 		},
 	)
+
+	// 执行级重试计数（result: scheduled/dispatched/exhausted/dispatch_failed）
+	SchedulerRetryTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dolphin_scheduler_retry_total",
+			Help: "Total number of execution retry events by result.",
+		},
+		[]string{"result"},
+	)
+
+	// 当前排队/执行中的重试数（in-memory，Leader 崩溃后归零，cron 兜底）
+	SchedulerRetriesPending = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "dolphin_scheduler_retries_pending",
+			Help: "Current number of retries scheduled (in-memory).",
+		},
+	)
+
+	// stale running 兜底救援次数：running 日志超过 task.timeout+grace 被判定为结果丢失
+	SchedulerStaleRunningRescuedTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "dolphin_scheduler_stale_running_rescued_total",
+			Help: "Total number of running task logs rescued because their result was lost.",
+		},
+	)
 )
 
 // ═══════════════════════════════════════════════
@@ -286,6 +311,36 @@ func RecordDagGate() {
 // RecordDagCycleReject 记录一次 DAG 环检测拒绝。
 func RecordDagCycleReject() {
 	SchedulerDagCycleRejectTotal.Inc()
+}
+
+// RecordRetryScheduled 记录一次重试排队。
+func RecordRetryScheduled() {
+	SchedulerRetryTotal.WithLabelValues("scheduled").Inc()
+}
+
+// RecordRetryDispatched 记录一次重试实际下发。
+func RecordRetryDispatched() {
+	SchedulerRetryTotal.WithLabelValues("dispatched").Inc()
+}
+
+// RecordRetryExhausted 记录一次重试耗尽（最终失败）。
+func RecordRetryExhausted() {
+	SchedulerRetryTotal.WithLabelValues("exhausted").Inc()
+}
+
+// RecordRetryDispatchFailed 记录重试下发失败（worker 不可用）。
+func RecordRetryDispatchFailed() {
+	SchedulerRetryTotal.WithLabelValues("dispatch_failed").Inc()
+}
+
+// SetRetriesPending 设置当前排队/执行中的重试数。
+func SetRetriesPending(n int64) {
+	SchedulerRetriesPending.Set(float64(n))
+}
+
+// RecordStaleRunningRescued 记录一次 stale running 兜底救援。
+func RecordStaleRunningRescued() {
+	SchedulerStaleRunningRescuedTotal.Inc()
 }
 
 // RecordFailoverRecovery 记录故障转移恢复耗时。

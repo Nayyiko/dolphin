@@ -20,6 +20,9 @@ const (
 	ConditionReconciling ConditionType = "Reconciling"
 	// ConditionDeps 依赖是否满足。有上游依赖的任务在门控期间为 False/BlockedOnDeps。
 	ConditionDeps ConditionType = "Dependencies"
+	// ConditionRetries 重试状态。失败后自动重试中为 True/Retrying；
+	// 重试次数耗尽为 False/RetriesExhausted。
+	ConditionRetries ConditionType = "Retries"
 )
 
 // ConditionStatus 条件状态。
@@ -66,4 +69,5 @@ var ValidConditionTypes = map[ConditionType]bool{
 	ConditionReady:       true,
 	ConditionReconciling: true,
 	ConditionDeps:        true,
+	ConditionRetries:     true,
 }

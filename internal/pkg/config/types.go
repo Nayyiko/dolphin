@@ -68,6 +68,10 @@ type SchedulerConfig struct {
 	Failover struct {
 		HeartbeatTimeout time.Duration `yaml:"heartbeat_timeout"`
 		MaxRetries       int           `yaml:"max_retries"`
+		// RetryBaseDelay 执行级重试基础退避：attempt n 延迟 = base * 2^(n-1)。
+		RetryBaseDelay time.Duration `yaml:"retry_base_delay"`
+		// StaleRunningGrace running 日志超过 task.timeout + grace 视为结果丢失并兜底救援。
+		StaleRunningGrace time.Duration `yaml:"stale_running_grace"`
 	} `yaml:"failover"`
 }
 

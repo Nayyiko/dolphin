@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"sync"
@@ -49,6 +50,11 @@ type Client struct {
 	hbCancel context.CancelFunc
 	// reconnectCh 通知 Run 循环"目标地址变了，立即重连"。
 	reconnectCh chan struct{}
+
+	// resultCh 执行结果缓冲队列。结果先入队由后台 drainResults 发送，
+	// 发送失败（断线/Leader 切换）时退避重试，保证结果不因瞬时连接抖动丢失。
+	// 容量足够容纳在途上限（capacity + capacity*2）。
+	resultCh chan *executor.TaskResult
 }
 
 // Config Worker 客户端配置。
@@ -76,6 +82,7 @@ func New(cfg Config, pool *executor.Pool) (*Client, error) {
 		ownAddr:     cfg.Address,
 		maxConc:     cfg.MaxConcurrency,
 		reconnectCh: make(chan struct{}, 1),
+		resultCh:    make(chan *executor.TaskResult, 256),
 	}, nil
 }
 
@@ -105,6 +112,10 @@ func (c *Client) UpdateAddr(addr string) {
 func (c *Client) Run(ctx context.Context) error {
 	backoff := time.Second
 	const maxBackoff = 30 * time.Second
+
+	// 启动结果上报排空循环：结果发送失败时退避重试，跨连接保留直到送达。
+	// 与 Run 共用 ctx：优雅关闭时排空剩余结果（见 drainResults）。
+	go c.drainResults(ctx)
 
 	for {
 		if ctx.Err() != nil {
@@ -330,13 +341,75 @@ func (c *Client) handleDispatch(d *pb.TaskDispatch) {
 }
 
 // ReportResult 上报任务执行结果（实现 executor.ResultReporter）。
-func (c *Client) ReportResult(ctx context.Context, r *executor.TaskResult) error {
+// 结果先入队，由后台 drainResults 发送；发送失败会退避重试，
+// 不会因为瞬时断线/Leader 切换而丢失。
+func (c *Client) ReportResult(_ context.Context, r *executor.TaskResult) error {
+	select {
+	case c.resultCh <- r:
+		return nil
+	default:
+		return errors.New("result queue full")
+	}
+}
+
+// drainResults 从结果队列取结果并发送。单 goroutine 保证同一任务多实例按序上报。
+// 发送失败（stream 未就绪/连接断开）时指数退避重试，直到送达或 ctx 取消。
+func (c *Client) drainResults(ctx context.Context) {
+	for {
+		select {
+		case r := <-c.resultCh:
+			c.sendResultWithRetry(ctx, r)
+		case <-ctx.Done():
+			// 优雅关闭：在有限窗口内尽力排空剩余结果。
+			// 调用方先 pool.Shutdown()（结果全部入队）再 cancel()，因此
+			// 这里能拿到全部在途结果；发不完的由调度器 stale-running 兜底。
+			deadline := time.After(5 * time.Second)
+			for {
+				select {
+				case r := <-c.resultCh:
+					c.sendResultOnce(r)
+				case <-deadline:
+					return
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+// sendResultWithRetry 发送一个结果，失败则退避重试。
+// 注意：先尝试发送再检查 ctx——优雅关闭时已在手的单个结果优先送出去，
+// 而不是因为 ctx 已取消就丢弃（剩余排队的由 drainResults 的 flush 窗口兜底）。
+func (c *Client) sendResultWithRetry(ctx context.Context, r *executor.TaskResult) {
+	backoff := 500 * time.Millisecond
+	const maxBackoff = 30 * time.Second
+	for {
+		if c.sendResultOnce(r) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return // 连接也发不出去，放弃（调度器 stale-running 兜底）
+		default:
+		}
+		if !sleep(ctx, backoff) {
+			return
+		}
+		if backoff < maxBackoff {
+			backoff *= 2
+		}
+	}
+}
+
+// sendResultOnce 尝试发送一个结果。返回是否成功。
+func (c *Client) sendResultOnce(r *executor.TaskResult) bool {
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
 	if c.stream == nil {
-		return io.ErrClosedPipe
+		return false // 连接尚未就绪
 	}
-	return c.stream.Send(&pb.WorkerMessage{
+	err := c.stream.Send(&pb.WorkerMessage{
 		Msg: &pb.WorkerMessage_TaskResult{
 			TaskResult: &pb.TaskResult{
 				InstanceId: r.InstanceID,
@@ -348,6 +421,11 @@ func (c *Client) ReportResult(ctx context.Context, r *executor.TaskResult) error
 			},
 		},
 	})
+	if err != nil {
+		slog.Warn("send result failed, will retry", "instance_id", r.InstanceID, "err", err)
+		return false
+	}
+	return true
 }
 
 // Close 关闭连接。

@@ -131,10 +131,14 @@ func main() {
 	<-quit
 	slog.Info("worker shutting down...")
 
-	// 优雅关闭
+	// 优雅关闭顺序很关键：
+	//   1. 先等执行中的任务完成（结果全部入队 resultCh，由客户端异步上报）
+	//   2. 再取消主循环（停止收发任务），drainResults 在排空窗口内发完剩余结果
+	//   3. 最后关闭连接
+	// 顺序颠倒会把"结果还没入队就断连"的结果丢在 worker 里。
+	pool.Shutdown()
 	cancel()
 	_ = cl.Close()
-	pool.Shutdown()
 	shutdownCtx, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel2()
 	_ = httpServer.Shutdown(shutdownCtx)

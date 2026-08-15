@@ -27,8 +27,8 @@ type SchedulerService struct {
 	manager *manager.Manager
 	cron    func(expr string) (time.Time, error) // cron 求值函数（注入避免循环依赖）
 
-	// onTaskResult 任务执行结果回调（供 Reconciler 推送下游任务，事件驱动 DAG）。
-	onTaskResult func(taskID string)
+	// onTaskResult 任务执行结果回调（供 Reconciler 推送下游任务 + 执行级重试）。
+	onTaskResult func(taskID, status string)
 
 	// workers: workerID → 出站流
 	mu      sync.RWMutex
@@ -60,8 +60,9 @@ func (s *SchedulerService) SetCronNext(fn func(expr string) (time.Time, error)) 
 	s.cron = fn
 }
 
-// SetOnTaskResult 注册任务执行结果回调。上游结果到达时由 Reconciler 推送下游任务。
-func (s *SchedulerService) SetOnTaskResult(fn func(taskID string)) {
+// SetOnTaskResult 注册任务执行结果回调。上游结果到达时由 Reconciler
+// 推送下游任务 + 触发执行级重试。
+func (s *SchedulerService) SetOnTaskResult(fn func(taskID, status string)) {
 	s.onTaskResult = fn
 }
 
@@ -215,10 +216,11 @@ func (s *SchedulerService) handleTaskResult(ctx context.Context, r *pb.TaskResul
 		Where("instance_id = ?", r.InstanceId).
 		Updates(updates)
 
-	// DAG 事件驱动：上游任务完成 → 通知 Reconciler 推送下游任务重新检查依赖。
+	// 事件驱动 DAG：上游任务完成 → 通知 Reconciler 推送下游任务重新检查依赖。
 	// 相比等 1s 轮询扫描，事件推送让下游在毫秒级被唤醒（backstop 仍是扫描器）。
+	// 同时触发执行级重试（失败/超时）。
 	if s.onTaskResult != nil && r.TaskId != "" {
-		s.onTaskResult(r.TaskId)
+		s.onTaskResult(r.TaskId, r.Status)
 	}
 }
 

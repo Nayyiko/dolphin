@@ -3,8 +3,10 @@ package reconciler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,14 +20,24 @@ import (
 	"github.com/yourname/dolphin/internal/scheduler/queue"
 )
 
+// 执行级重试的默认参数。
+const (
+	// defaultRetryBaseDelay 重试基础退避：attempt n 的延迟 = base * 2^(n-1)。
+	defaultRetryBaseDelay = 2 * time.Second
+	// defaultStaleRunningGrace running 日志超过 task.timeout + grace 视为结果丢失。
+	defaultStaleRunningGrace = 30 * time.Second
+	// maxRetryDispatchFailures 单次重试尝试里，因 worker 不可用而重新下发的次数上限。
+	maxRetryDispatchFailures = 5
+)
+
 // DolphinFinalizer 终结器名称。任务删除时先执行清理，再移除终结器真正删除。
 const DolphinFinalizer = "dolphin.io/task-cleanup"
 
 // TaskExecutor 任务执行接口。
 // 由 server 层实现（将任务下发给 Worker）。
 type TaskExecutor interface {
-	// Execute 将任务下发给 Worker。返回执行结果。
-	Execute(ctx context.Context, task *model.Task) (ExecuteResult, error)
+	// Execute 使用给定的 instanceID 将任务下发给 Worker。返回执行结果。
+	Execute(ctx context.Context, task *model.Task, instanceID string) (ExecuteResult, error)
 	// Cancel 通知 Worker 取消某次执行。
 	Cancel(ctx context.Context, instanceID string) error
 }
@@ -54,9 +66,18 @@ type Reconciler struct {
 
 	workers int
 
-	mu     sync.Mutex
+	mu      sync.Mutex
 	running map[string]bool // taskID → 正在执行中（避免重复调度）
 	blocked map[string]bool // taskID → 依赖未满足被挂起（用于 DAG 指标）
+
+	// 执行级重试状态。
+	retryBaseDelay time.Duration
+	leaderMu       sync.RWMutex
+	leaderCtx      context.Context // 当前任期的 Leader ctx（失权后 cancel，重试停止）
+	retryMu        sync.Mutex
+	retrying       map[string]bool // taskID → 已有重试在排队/执行中（防重复）
+	dispatchFailures map[string]int // taskID → 同一次重试尝试下发失败次数
+	retryPending   atomic.Int64    // 排队中的重试数（指标）
 }
 
 // NewReconciler 创建协调器。
@@ -72,16 +93,41 @@ func NewReconciler(
 		numWorkers = 4
 	}
 	return &Reconciler{
-		queue:    q,
-		lister:   lister,
-		db:       mgr.DB(),
-		manager:  mgr,
-		executor: executor,
-		cronNext: cronNext,
-		workers:  numWorkers,
-		running:  make(map[string]bool),
-		blocked:  make(map[string]bool),
+		queue:          q,
+		lister:         lister,
+		db:             mgr.DB(),
+		manager:        mgr,
+		executor:       executor,
+		cronNext:       cronNext,
+		workers:        numWorkers,
+		running:        make(map[string]bool),
+		blocked:        make(map[string]bool),
+		retryBaseDelay: defaultRetryBaseDelay,
+		retrying:       make(map[string]bool),
+		dispatchFailures: make(map[string]int),
 	}
+}
+
+// SetLeaderCtx 设置当前任期的 Leader context。
+// 由 main 在 become leader 时注入；失权后该 ctx 被 cancel，重试定时器随之停止。
+func (r *Reconciler) SetLeaderCtx(ctx context.Context) {
+	r.leaderMu.Lock()
+	defer r.leaderMu.Unlock()
+	r.leaderCtx = ctx
+}
+
+// SetRetryPolicy 设置重试策略参数（<=0 时保持默认）。
+func (r *Reconciler) SetRetryPolicy(baseDelay time.Duration) {
+	if baseDelay <= 0 {
+		return
+	}
+	r.retryBaseDelay = baseDelay
+}
+
+func (r *Reconciler) getLeaderCtx() context.Context {
+	r.leaderMu.RLock()
+	defer r.leaderMu.RUnlock()
+	return r.leaderCtx
 }
 
 // EnqueueTask 将任务推入协调队列（由 Informer 事件处理器调用）。
@@ -254,6 +300,70 @@ func (r *Reconciler) checkWorkerHeartbeats(ctx context.Context, timeout time.Dur
 	return nil
 }
 
+// RunStaleRunningScanner 兜底救援：定期扫描 running 日志，
+// 若其存活时间超过 task.timeout + grace（结果上报大概率丢失/worker 挂死），
+// 置为 failed 并触发重试。这是执行结果链路可靠性的最后一道保险。
+// 仅 Leader 运行。
+func (r *Reconciler) RunStaleRunningScanner(ctx context.Context, interval, grace time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := r.rescueStaleRunning(ctx, grace); err != nil {
+				slog.Warn("stale running scan failed", "err", err)
+			}
+		}
+	}
+}
+
+// rescueStaleRunning 扫描并救援超龄 running 日志。
+func (r *Reconciler) rescueStaleRunning(ctx context.Context, grace time.Duration) error {
+	if grace <= 0 {
+		grace = defaultStaleRunningGrace
+	}
+	now := time.Now()
+
+	var logs []model.TaskLog
+	if err := r.db.WithContext(ctx).
+		Where("status = ?", model.TaskLogStatusRunning).
+		Find(&logs).Error; err != nil {
+		return err
+	}
+
+	for i := range logs {
+		l := logs[i]
+		// 该任务允许的最长执行窗口：task.timeout + grace
+		timeout := 30
+		if item, ok := r.lister.Get(l.TaskID); ok && item.Task.Timeout > 0 {
+			timeout = item.Task.Timeout
+		}
+		deadline := l.StartTime.Add(time.Duration(timeout)*time.Second + grace)
+		if now.Before(deadline) {
+			continue
+		}
+
+		metrics.RecordStaleRunningRescued()
+		errMsg := "stale running: result report lost or worker hung, re-scheduling"
+		if err := r.db.WithContext(ctx).Model(&l).Updates(map[string]any{
+			"status":    model.TaskLogStatusFailed,
+			"end_time":  &now,
+			"error_msg": errMsg,
+		}).Error; err != nil {
+			slog.Warn("rescue stale running failed", "instance_id", l.InstanceID, "err", err)
+			continue
+		}
+		slog.Warn("rescued stale running task", "task_id", l.TaskID,
+			"instance_id", l.InstanceID, "retry_count", l.RetryCount,
+			"timeout", timeout, "grace", grace.Round(time.Second))
+		// 触发重试（失败结果走同一套重试逻辑）
+		r.scheduleRetry(l.TaskID)
+	}
+	return nil
+}
+
 func (r *Reconciler) worker(ctx context.Context) {
 	for {
 		key, shutdown := r.queue.GetCtx(ctx)
@@ -315,7 +425,7 @@ func (r *Reconciler) reconcile(ctx context.Context, taskID string) error {
 			r.setCondition(ctx, task.ID, model.ConditionDeps, model.StatusTrue,
 				"DepsSatisfied", "")
 		}
-		if err := r.dispatch(ctx, &task); err != nil {
+		if err := r.dispatch(ctx, &task, 0, true); err != nil {
 			return err
 		}
 		slog.Debug("task dispatched", "task_id", task.ID, "reason", reason)
@@ -414,7 +524,11 @@ func (r *Reconciler) setBlocked(taskID string, blocked bool) {
 }
 
 // dispatch 选择 Worker 并下发任务。
-func (r *Reconciler) dispatch(ctx context.Context, task *model.Task) error {
+//
+// retryCount 是本次尝试的编号（0=首次执行，1..N=第 N 次重试），写入 task_log。
+// advanceNext 为 true 时（首次下发）预计算并推进 next_run_at；重试时传 false，
+// 因为首次下发已推进过，重试不应把 cron 周期再往前推。
+func (r *Reconciler) dispatch(ctx context.Context, task *model.Task, retryCount int, advanceNext bool) error {
 	// 防止并发重复调度
 	r.mu.Lock()
 	if r.running[task.ID] {
@@ -429,41 +543,52 @@ func (r *Reconciler) dispatch(ctx context.Context, task *model.Task) error {
 		r.mu.Unlock()
 	}()
 
-	// 执行（下发 Worker）
-	result, err := r.executor.Execute(ctx, task)
-	if err != nil {
-		return err
-	}
-
-	// 记录调度指标：计数 + 调度延迟（任务到期时间 → 实际下发时间）
-	lag := time.Since(task.NextRunAt)
-	if lag < 0 {
-		lag = 0 // 手动触发时 next_run_at 可能被设为过去，取 0
-	}
-	metrics.RecordDispatch(task.HandlerType, lag, true)
-
-	// 记录执行日志
-	instanceID := result.InstanceID
-	if instanceID == "" {
-		instanceID = uuid.NewString()
-	}
+	// 先落执行日志，再下发 Worker。
+	// 顺序保证：Worker 的快速拒绝/结果上报到达时，日志必然已存在，
+	// 否则会出现"结果先到、log 未建"→ 更新 0 行 + 幻影 running 日志的竞态。
+	instanceID := uuid.NewString()
 	now := time.Now()
 	log := &model.TaskLog{
 		ID:         uuid.NewString(),
 		TaskID:     task.ID,
 		InstanceID: instanceID,
-		WorkerID:   result.WorkerID,
 		Status:     model.TaskLogStatusRunning,
 		StartTime:  now,
-		RetryCount: 0,
+		RetryCount: retryCount,
 		CreatedAt:  now,
 	}
 	if err := r.db.WithContext(ctx).Create(log).Error; err != nil {
 		return err
 	}
 
-	// 预计算下一次触发时间
-	if r.cronNext != nil {
+	// 执行（下发 Worker）
+	result, err := r.executor.Execute(ctx, task, instanceID)
+	if err != nil {
+		// 下发失败（无可用 Worker/断连）：把日志标记失败，交给上层
+		// （reconcile 限速重入队 / doRetry 退避）重新调度。
+		r.db.WithContext(ctx).Model(log).Updates(map[string]any{
+			"status":    model.TaskLogStatusFailed,
+			"end_time":  &now,
+			"error_msg": err.Error(),
+		})
+		return err
+	}
+
+	// 回填 Worker（下发达成后才有 worker_id；空值会导致 Worker 故障转移
+	// 无法匹配该 running 日志，故必须补齐）。
+	if result.WorkerID != "" {
+		r.db.WithContext(ctx).Model(log).Update("worker_id", result.WorkerID)
+	}
+
+	// 记录调度指标：计数 + 调度延迟（任务到期时间 → 实际下发时间）
+	lag := time.Since(task.NextRunAt)
+	if lag < 0 {
+		lag = 0 // 手动触发/重试时 next_run_at 在未来，取 0
+	}
+	metrics.RecordDispatch(task.HandlerType, lag, true)
+
+	// 预计算下一次触发时间（仅首次下发推进 cron 周期）
+	if advanceNext && r.cronNext != nil {
 		next, err := r.cronNext(task.CronExpr)
 		if err == nil {
 			if err := r.manager.UpdateNextRunAt(ctx, task.ID, next); err != nil {
@@ -476,12 +601,190 @@ func (r *Reconciler) dispatch(ctx context.Context, task *model.Task) error {
 	}
 
 	// 更新 Conditions
+	condReason := "Dispatched"
+	if retryCount > 0 {
+		condReason = "Retrying"
+	}
 	r.setCondition(ctx, task.ID, model.ConditionScheduled, model.StatusTrue,
-		"Dispatched", "dispatched to worker "+result.WorkerID)
+		condReason, fmt.Sprintf("dispatched attempt %d to worker %s", retryCount, result.WorkerID))
 	r.setCondition(ctx, task.ID, model.ConditionRunning, model.StatusTrue,
 		"Executing", "instance "+instanceID)
 
 	return nil
+}
+
+// OnTaskResult 任务执行结果到达时的回调（由 server 层在收到 TaskResult 后调用）。
+// 做两件事：
+//  1. 事件驱动 DAG：推送直接依赖该任务的下游重新检查依赖。
+//  2. 执行级重试：失败/超时且重试次数未耗尽 → 按指数退避自动重新下发。
+func (r *Reconciler) OnTaskResult(taskID, status string) {
+	r.EnqueueDependents(taskID)
+	if status == model.TaskLogStatusFailed || status == model.TaskLogStatusTimeout {
+		r.scheduleRetry(taskID)
+	}
+}
+
+// retryBackoff 返回第 n 次重试的退避时长（n 从 0 起）：base * 2^n。
+func (r *Reconciler) retryBackoff(n int) time.Duration {
+	base := r.retryBaseDelay
+	if base <= 0 {
+		base = defaultRetryBaseDelay
+	}
+	if n > 30 {
+		n = 30 // 防止整数溢出
+	}
+	return base * time.Duration(1<<uint(n))
+}
+
+// retryDecision 纯函数：根据已发生的重试次数和上限，决定下一次重试的
+// (attempt 编号, 退避时长, 是否可重试)。
+// lastRetryCount 是最近一次尝试的编号（0=首次执行），maxRetries 是上限。
+func retryDecision(lastRetryCount, maxRetries int, baseDelay time.Duration) (attempt int, delay time.Duration, ok bool) {
+	if maxRetries <= 0 {
+		return 0, 0, false // 重试被禁用
+	}
+	attempt = lastRetryCount + 1
+	if attempt > maxRetries {
+		return 0, 0, false // 已耗尽
+	}
+	if baseDelay <= 0 {
+		baseDelay = defaultRetryBaseDelay
+	}
+	n := attempt - 1
+	if n > 30 {
+		n = 30
+	}
+	return attempt, baseDelay * time.Duration(1<<uint(n)), true
+}
+
+// lastRetryCount 返回任务最近一次尝试的重试编号（0=首次，n=第 n 次重试）。
+func (r *Reconciler) lastRetryCount(taskID string) int {
+	var logs []model.TaskLog
+	r.db.Where("task_id = ?", taskID).
+		Order("created_at DESC").
+		Limit(1).
+		Find(&logs)
+	if len(logs) == 0 {
+		return 0
+	}
+	return logs[0].RetryCount
+}
+
+// scheduleRetry 为失败的任务安排一次重试。
+// 幂等：同一任务同时只有一个重试在排队/执行中（retrying 标记去重）。
+// 重试状态在内存中（Leader 崩溃后丢失，由 cron 兜底保证最终会再执行）。
+func (r *Reconciler) scheduleRetry(taskID string) {
+	ctx := r.getLeaderCtx()
+	if ctx == nil || ctx.Err() != nil {
+		return // 非 Leader / 已失权：不安排重试
+	}
+
+	r.retryMu.Lock()
+	if r.retrying[taskID] {
+		r.retryMu.Unlock()
+		return
+	}
+	r.retrying[taskID] = true
+	r.retryMu.Unlock()
+
+	// 任务不存在/非 active/显式 max_retries=0 → 不重试
+	task, err := r.manager.Get(ctx, taskID)
+	if err != nil || task.Status != model.TaskStatusActive || task.MaxRetries <= 0 {
+		r.clearRetrying(taskID)
+		return
+	}
+
+	// 纯函数决策：已尝试次数 → 下一次 (attempt, delay)。耗尽则最终失败。
+	attempt, delay, ok := retryDecision(r.lastRetryCount(taskID), int(task.MaxRetries), r.retryBaseDelay)
+	if !ok {
+		// maxRetries=0 已在上面排除，这里只能是"已耗尽"。
+		r.setCondition(ctx, taskID, model.ConditionRetries, model.StatusFalse,
+			"RetriesExhausted",
+			fmt.Sprintf("task failed after %d attempts (max_retries=%d)", int(task.MaxRetries)+1, task.MaxRetries))
+		metrics.RecordRetryExhausted()
+		r.clearRetrying(taskID)
+		return
+	}
+
+	// 已有执行中的实例（如手动触发抢先）→ 等它出结果自行触发重试逻辑
+	if r.hasRunningInstance(ctx, taskID) {
+		r.clearRetrying(taskID)
+		return
+	}
+
+	metrics.RecordRetryScheduled()
+	r.retryPending.Add(1)
+	metrics.SetRetriesPending(r.retryPending.Load())
+	slog.Info("execution retry scheduled",
+		"task_id", taskID, "attempt", attempt, "delay", delay.Round(time.Millisecond))
+
+	time.AfterFunc(delay, func() {
+		r.doRetry(ctx, taskID, attempt)
+	})
+}
+
+// doRetry 执行一次重试下发。
+func (r *Reconciler) doRetry(ctx context.Context, taskID string, attempt int) {
+	r.retryPending.Add(-1)
+	metrics.SetRetriesPending(r.retryPending.Load())
+
+	if ctx.Err() != nil {
+		r.clearRetrying(taskID)
+		return
+	}
+
+	// 以 DB 为准重新读取任务（缓存可能滞后于 pause/删除）
+	task, err := r.manager.Get(ctx, taskID)
+	if err != nil || task.Status != model.TaskStatusActive || attempt > task.MaxRetries {
+		r.clearRetrying(taskID)
+		return
+	}
+
+	// 已存在执行中的实例（手动触发等）→ 跳过，避免重复执行
+	if r.hasRunningInstance(ctx, taskID) {
+		r.clearRetrying(taskID)
+		return
+	}
+
+	metrics.RecordRetryDispatched()
+	if err := r.dispatch(ctx, task, attempt, false); err != nil {
+		// 下发失败（worker 暂时不可用）→ 保持 retrying 标记，退避后重试同一次尝试。
+		// 有次数上限，避免 worker 一直不来时无限自旋。
+		metrics.RecordRetryDispatchFailed()
+		failures := r.retryDispatchFailures(taskID)
+		if failures >= maxRetryDispatchFailures {
+			slog.Warn("retry dispatch giving up after repeated failures", "task_id", taskID,
+				"attempt", attempt, "failures", failures)
+			r.clearRetrying(taskID)
+			return
+		}
+		delay := r.retryBackoff(attempt - 1)
+		slog.Warn("retry dispatch failed, retrying later", "task_id", taskID,
+			"attempt", attempt, "err", err, "delay", delay.Round(time.Millisecond))
+		time.AfterFunc(delay, func() {
+			r.doRetry(ctx, taskID, attempt)
+		})
+		return
+	}
+	r.clearRetrying(taskID)
+}
+
+// retryDispatchFailures 统计同一次重试尝试里下发失败的次数（并发安全）。
+func (r *Reconciler) retryDispatchFailures(taskID string) int {
+	// 简化：用 retrying 标记的时长近似失败次数不准确，
+	// 这里用一个独立的计数器 map 跟踪。
+	r.retryMu.Lock()
+	defer r.retryMu.Unlock()
+	r.dispatchFailures[taskID]++
+	return r.dispatchFailures[taskID]
+}
+
+// clearRetrying 清除任务的重试去重标记和失败计数。
+func (r *Reconciler) clearRetrying(taskID string) {
+	r.retryMu.Lock()
+	delete(r.retrying, taskID)
+	delete(r.dispatchFailures, taskID)
+	r.retryMu.Unlock()
 }
 
 // handleMissedSchedule 补偿漏调度：next_run_at 已过期但未执行（可能因 Worker 不足）。
@@ -497,7 +800,7 @@ func (r *Reconciler) handleMissedSchedule(ctx context.Context, task *model.Task)
 		slog.Warn("missed schedule detected", "task_id", task.ID,
 			"next_run_at", task.NextRunAt)
 		// 立即补一次调度
-		_ = r.dispatch(ctx, task)
+		_ = r.dispatch(ctx, task, 0, true)
 	}
 }
 

@@ -18,3 +18,5 @@ reconciler:
 failover:
   heartbeat_timeout: 30s
   max_retries: 3
+  retry_base_delay: 2s
+  stale_running_grace: 30s

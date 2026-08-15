@@ -398,7 +398,7 @@ func runStress(args []string) {
 	fs := flag.NewFlagSet("stress", flag.ExitOnError)
 	fs.Usage = func() {
 		fmt.Println(`stress 子命令:
-  create --count <n> --prefix <name> --cron <expr> --handler <url> [--type http|shell] [--timeout <sec>]
+  create --count <n> --prefix <name> --cron <expr> --handler <url> [--type http|shell] [--timeout <sec>] [--retries <n>]
   trigger --id <id> --count <n>   # 手动触发 n 次（测调度吞吐/延迟）`)
 	}
 	if len(args) < 1 {
@@ -421,7 +421,7 @@ func runStress(args []string) {
 	case "create":
 		var count int
 		var prefix, cronExpr, handler, handlerType string
-		var taskTimeout int
+		var taskTimeout, retries int
 		fs := flag.NewFlagSet("create", flag.ExitOnError)
 		fs.IntVar(&count, "count", 100, "number of tasks to create")
 		fs.StringVar(&prefix, "prefix", "stress", "task name prefix")
@@ -429,6 +429,7 @@ func runStress(args []string) {
 		fs.StringVar(&handler, "handler", "http://localhost:9090/healthz", "handler URL")
 		fs.StringVar(&handlerType, "type", "http", "handler type")
 		fs.IntVar(&taskTimeout, "timeout", 10, "timeout seconds")
+		fs.IntVar(&retries, "retries", 3, "max retries (0 = no auto-retry)")
 		_ = fs.Parse(subArgs)
 		if count <= 0 {
 			slog.Error("--count must be > 0")
@@ -445,7 +446,7 @@ func runStress(args []string) {
 				Handler:     handler,
 				HandlerType: handlerType,
 				Timeout:     int32(taskTimeout),
-				MaxRetries:  3,
+				MaxRetries:  int32(retries),
 			})
 			if err != nil {
 				slog.Warn("create failed", "i", i, "err", err)

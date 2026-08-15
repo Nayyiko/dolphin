@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/google/uuid"
-
 	"github.com/yourname/dolphin/api/proto/pb"
 	"github.com/yourname/dolphin/internal/pkg/model"
 	"github.com/yourname/dolphin/internal/scheduler/reconciler"
@@ -73,16 +71,15 @@ func NewTaskExecutor(d Dispatcher, sel WorkerSelector) *TaskExecutor {
 	return &TaskExecutor{dispatcher: d, selector: sel}
 }
 
-// Execute 选择 Worker 并下发任务。
-// 返回 ExecuteResult。若没有可用 Worker 返回错误（触发 Reconciler 限速重试）。
-func (e *TaskExecutor) Execute(ctx context.Context, task *model.Task) (reconciler.ExecuteResult, error) {
+// Execute 选择 Worker 并下发任务。instanceID 由调用方（Reconciler）生成，
+// 保证日志先于下发落库、结果与日志一一对应。返回执行结果。
+func (e *TaskExecutor) Execute(ctx context.Context, task *model.Task, instanceID string) (reconciler.ExecuteResult, error) {
 	workers := e.dispatcher.OnlineWorkers()
 	worker := e.selector.Select(workers)
 	if worker == nil {
 		return reconciler.ExecuteResult{}, fmt.Errorf("no available worker for task %s", task.ID)
 	}
 
-	instanceID := uuid.NewString()
 	dispatch := &pb.TaskDispatch{
 		TaskId:      task.ID,
 		InstanceId:  instanceID,

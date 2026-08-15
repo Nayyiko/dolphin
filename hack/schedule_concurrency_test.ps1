@@ -65,7 +65,7 @@ Write-Host "已清理 tasks / task_logs / task_conditions"
 # ---------- 1. 批量创建（stress create 进程内批量，比逐条 create 快 ~10x） ----------
 Write-Step "1. 批量创建 $TaskCount 个任务（handler sleep $SleepSeconds s）"
 $startCreate = Get-Date
-& "$Bins\dolphinctl.exe" --addr "localhost:50051" stress create --count $TaskCount --prefix $NamePrefix --cron "0 0 1 1 *" --handler "http://localhost:9090/debug/sleep?seconds=$SleepSeconds" --timeout ($SleepSeconds + 5) 2>&1 | Out-Null
+& "$Bins\dolphinctl.exe" --addr "localhost:50051" stress create --count $TaskCount --prefix $NamePrefix --cron "0 0 1 1 *" --handler "http://localhost:9090/debug/sleep?seconds=$SleepSeconds" --timeout ($SleepSeconds + 5) --retries 0 2>&1 | Out-Null
 $createSec = ((Get-Date) - $startCreate).TotalSeconds
 # 收集本批任务 id（步骤 0 已清空 tasks，剩余都是本批）
 $idsRaw = SqlScalar "SELECT GROUP_CONCAT(id) FROM dolphin.tasks WHERE name LIKE '$NamePrefix%';"
