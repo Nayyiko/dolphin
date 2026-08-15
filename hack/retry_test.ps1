@@ -276,8 +276,9 @@ if (-not $SkipPoolFull) {
     # ── 决定性判据：每个任务真实执行时长（end_time - start_time）。
     #    avg_dur ~= 2s → 执行正常，243s 是轮询循环慢/多 worker 分流的假象；
     #    avg_dur 几十秒 → 执行本身被拖慢（sleep 端点被争抢/worker 串行），才是真瓶颈。
-    $avgDurC = [int](SqlScalar "SELECT COALESCE(ROUND(AVG(TIMESTAMPDIFF(MILLISECOND, start_time, end_time))/1000, 2), -1) FROM dolphin.task_logs l JOIN tasks t ON t.id=l.task_id WHERE t.name LIKE 'rt-C-%' AND l.end_time IS NOT NULL;")
-    $maxDurC = [int](SqlScalar "SELECT COALESCE(ROUND(MAX(TIMESTAMPDIFF(MILLISECOND, start_time, end_time))/1000, 2), -1) FROM dolphin.task_logs l JOIN tasks t ON t.id=l.task_id WHERE t.name LIKE 'rt-C-%' AND l.end_time IS NOT NULL;")
+    #    注意：MySQL TIMESTAMPDIFF 没有 MILLISECOND 单位，用 MICROSECOND/1000000 换算秒。
+    $avgDurC = SqlScalar "SELECT COALESCE(ROUND(AVG(TIMESTAMPDIFF(MICROSECOND, start_time, end_time))/1000000, 2), -1) FROM dolphin.task_logs l JOIN tasks t ON t.id=l.task_id WHERE t.name LIKE 'rt-C-%' AND l.end_time IS NOT NULL;"
+    $maxDurC = SqlScalar "SELECT COALESCE(ROUND(MAX(TIMESTAMPDIFF(MICROSECOND, start_time, end_time))/1000000, 2), -1) FROM dolphin.task_logs l JOIN tasks t ON t.id=l.task_id WHERE t.name LIKE 'rt-C-%' AND l.end_time IS NOT NULL;"
     # 结果落库跨度：首个到最后一个结果写入的时差（真实执行时间线，而非下发时间线）
     $endSpanC = [int](SqlScalar "SELECT COALESCE(TIMESTAMPDIFF(SECOND, MIN(end_time), MAX(end_time)), 0) FROM dolphin.task_logs l JOIN tasks t ON t.id=l.task_id WHERE t.name LIKE 'rt-C-%' AND l.end_time IS NOT NULL;")
     # 有几个 worker 实际执行了任务（>1 = 残留 worker 进程分流）
