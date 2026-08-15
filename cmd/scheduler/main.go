@@ -328,6 +328,16 @@ func main() {
 				}
 				w.WriteHeader(http.StatusOK)
 				_, _ = w.Write([]byte("recovered"))
+			case "/debug/reset-fail":
+				// 清空 /debug/fail 的失败计数器。测试脚本每轮开始前调用，
+				// 避免上一轮的失败计数残留导致"前 N 次失败"语义串轮次
+				// （如 scenario B 在重跑时第一次请求就直接 recovered）。
+				failCounts.Range(func(k, _ any) bool {
+					failCounts.Delete(k)
+					return true
+				})
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("fail counters reset"))
 			default:
 				http.NotFound(w, r)
 			}

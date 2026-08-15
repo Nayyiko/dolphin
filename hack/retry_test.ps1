@@ -119,6 +119,10 @@ try {
 Write-Step "0. 清理旧数据"
 docker exec dolphin-mysql mysql -u root -pdolphin -e "USE dolphin; DELETE FROM task_conditions; DELETE FROM task_logs; DELETE FROM tasks;" 2>$null
 Write-Host "已清理 tasks / task_logs / task_conditions"
+# 重置 /debug/fail 失败计数器（进程内累计，不清会串轮次：
+# 场景 B 用 ?times=2 语义，上一轮已消耗 2 次失败，重跑首请求就直接 recovered）
+try { $null = Invoke-WebRequest -Uri "http://localhost:9090/debug/reset-fail" -UseBasicParsing -TimeoutSec 3 } catch { Write-Host "  ⚠️ /debug/reset-fail 调用失败（旧 scheduler？）" -ForegroundColor Yellow }
+Write-Host "已重置 /debug/fail 计数器（本轮失败编号从 #1 起）"
 
 # ---------- 场景 A：失败 → 自动重试 → 耗尽 ----------
 Write-Step "A. 执行级重试：持续失败 → 指数退避重试 → RetriesExhausted"
@@ -182,7 +186,8 @@ if (-not $SkipPoolFull) {
     # ~6300 字符会被截断，导致只触发前 ~27 个，多任务场景全变假）。逐行取再 join。
     $idsC = ((SqlRows "SELECT id FROM dolphin.tasks WHERE name LIKE 'rt-C-%';") -join ",")
     Write-Host "  创建 170 个 sleep(2s) 任务，触发全部（实际 id 数 = $(($idsC -split ',').Count)）"
-    & "$Bins\dolphinctl.exe" --addr $SCHED task trigger-batch --ids $idsC 2>&1 | Out-Null
+    $trigOut = & "$Bins\dolphinctl.exe" --addr $SCHED task trigger-batch --ids $idsC 2>&1
+    Write-Host "  trigger-batch: $($trigOut -join ' ')"
 
     $okC = 0
     for ($i = 0; $i -lt $WaitMaxSec * 2; $i++) {
