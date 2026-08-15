@@ -76,6 +76,23 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 数据库连接池调优：database/sql 默认 MaxIdleConns=2，而 Reconciler
+	// 用 workers(50) 个 goroutine 并发查 DB（每次 reconcile ~9 次往返），
+	// 默认配置会导致连接疯狂开/关（Windows Docker MySQL 每次握手 ~50-200ms），
+	// 把分发速率拖垮（实测 170 任务 ~150s 才跑完，等效并发 ~2）。
+	// 显式调大连接池，让并发查询复用连接。
+	sqlDB, err := db.DB()
+	if err != nil {
+		slog.Error("get sql db handle failed", "err", err)
+		os.Exit(1)
+	}
+	sqlDB.SetMaxOpenConns(120)                                  // 并发查询上限，留余量给其他客户端
+	sqlDB.SetMaxIdleConns(50)                                   // 与 reconciler workers 对齐，避免空闲即关
+	sqlDB.SetConnMaxLifetime(30 * time.Minute)                  // 定期换连，避免长期 TCP 连接被中间设备断开
+	sqlDB.SetConnMaxIdleTime(5 * time.Minute)                   // 空闲超时回收
+	slog.Info("mysql connection pool configured",
+		"max_open", 120, "max_idle", 50)
+
 	// ── etcd ──
 	etcdCli, err := etcdutil.NewClient(cfg.Etcd.Endpoints, cfg.Etcd.DialTimeout)
 	if err != nil {

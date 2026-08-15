@@ -373,15 +373,19 @@ func (r *Reconciler) worker(ctx context.Context) {
 		start := time.Now()
 		err := r.reconcile(ctx, key)
 		metrics.RecordReconcile(time.Since(start))
+		// 无论成败都必须 Done(key)：否则该 key 永远留在 processing 集合，
+		// 之后任何 Add 只会置 dirty 而不会真正入队（Add 在 processing 时直接返回），
+		// 任务被永久卡死、永不重试（真实踩过的坑：reconcile 出错后任务再无下文）。
 		if err != nil {
-			// 失败 → 限速重新入队（指数退避）
+			// 失败 → 限速重新入队（指数退避）。AddRateLimited 的 AfterFunc 至少
+			// baseDelay(5s) 后才触发，此时 Done 早已执行，重新入队不会被 processing 挡住。
 			slog.Warn("reconcile failed, rate-limited requeue", "task_id", key, "err", err)
 			r.queue.AddRateLimited(key)
 		} else {
 			// 成功 → 清除限速记录
 			r.queue.Forget(key)
-			r.queue.Done(key)
 		}
+		r.queue.Done(key)
 	}
 }
 

@@ -180,6 +180,7 @@ Write-Result ($retryDeltaB -ge 1) "retry_total{result=scheduled} 增量 = $retry
 if (-not $SkipPoolFull) {
     Write-Step "C. 池满背压自动重试：170 任务 > 在途上限 150，超出部分自动重试直到成功"
     $retryBaseC = Get-RetryMetric $M9090 "scheduled"
+    $dispatchBaseC = Get-Metric $M9090 "dolphin_scheduler_dispatch_total"
     $startC = Get-Date
     & "$Bins\dolphinctl.exe" --addr $SCHED stress create --count 170 --prefix "rt-C" --cron "0 0 1 1 *" --handler "http://localhost:9090/debug/sleep?seconds=2" --timeout 10 --retries 3 2>&1 | Out-Null
     # 收集 id：不能用 GROUP_CONCAT（默认 group_concat_max_len=1024，170 个 UUID
@@ -190,19 +191,28 @@ if (-not $SkipPoolFull) {
     Write-Host "  trigger-batch: $($trigOut -join ' ')"
 
     $okC = 0
+    $peakExecC = 0
     for ($i = 0; $i -lt $WaitMaxSec * 2; $i++) {
         $okC = [int](SqlScalar "SELECT COUNT(DISTINCT l.task_id) FROM dolphin.task_logs l JOIN tasks t ON t.id=l.task_id WHERE t.name LIKE 'rt-C-%' AND l.status='success';")
+        $eC = Get-Metric $M9091 "dolphin_worker_tasks_executing"
+        if ($eC -gt $peakExecC) { $peakExecC = $eC }
         if ($okC -ge 170) { break }
         Start-Sleep -Milliseconds 500
     }
     $elapsedC = [math]::Round(((Get-Date) - $startC).TotalSeconds, 1)
     $multiC = [int](SqlScalar "SELECT COUNT(*) FROM tasks t WHERE t.name LIKE 'rt-C-%' AND (SELECT COUNT(*) FROM task_logs WHERE task_id=t.id) > 1;")
     $retryDeltaC = (Get-RetryMetric $M9090 "scheduled") - $retryBaseC
+    $dispatchDeltaC = (Get-Metric $M9090 "dolphin_scheduler_dispatch_total") - $dispatchBaseC
+    # 没有任何 task_log 的任务数：reconcile 没下发成功（之前 workqueue Done 泄漏时
+    # reconcile 出错会让任务永久卡死、连日志都不建），应为 0。
+    $noLogC = [int](SqlScalar "SELECT COUNT(*) FROM tasks t WHERE t.name LIKE 'rt-C-%' AND NOT EXISTS (SELECT 1 FROM task_logs l WHERE l.task_id = t.id);")
     # 失败的任务（最新日志非 success）应为 0
     $notDoneC = [int](SqlScalar "SELECT COUNT(*) FROM tasks t WHERE t.name LIKE 'rt-C-%' AND (SELECT status FROM task_logs WHERE task_id=t.id ORDER BY created_at DESC LIMIT 1) <> 'success';")
     Write-Host "  全部成功用时 ${elapsedC}s；重试任务数 = $multiC；retry_total 增量 = $retryDeltaC"
+    Write-Host "  诊断：下发增量 = $dispatchDeltaC/170；worker 执行峰值 = $peakExecC；无日志任务 = $noLogC"
     Write-Result ($okC -ge 170) "170 个任务全部最终 success"
     Write-Result ($notDoneC -eq 0) "最新日志全部为 success（无残留失败）"
+    Write-Result ($noLogC -eq 0) "无日志任务 = $noLogC（期望 0，无任务卡死在调度队列）"
     Write-Result ($multiC -gt 0) "$multiC 个任务经历过重试（池满被拒后自动重试，而非等 cron）"
     Write-Result ($retryDeltaC -ge 1) "retry_total{result=scheduled} 增量 = $retryDeltaC"
 } else {
