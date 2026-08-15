@@ -97,6 +97,25 @@ Write-Step "0. 前置检查"
 if (-not (Wait-Healthz $M9090 5)) { Write-Host "❌ scheduler 未就绪（9090 无 /healthz）" -ForegroundColor Red; exit 1 }
 if (-not (Wait-Healthz $M9091 5)) { Write-Host "❌ worker 未就绪（9091 无 /healthz）" -ForegroundColor Red; exit 1 }
 
+# 版本自检：/debug/fail 是新代码才有的调试端点。旧 scheduler.exe 无此路由 → 404，
+# 会让场景 A/B 拿到 "http 404" 而非重试链路（重试逻辑也在旧二进制里没有）。
+# 这里快速失败给出明确提示，而不是跑出一堆 404 假数据。
+try {
+    $null = Invoke-WebRequest -Uri "http://localhost:9090/debug/fail" -UseBasicParsing -TimeoutSec 3
+    Write-Host "  ⚠️ /debug/fail 返回 200（预期失败），行为异常，继续但请留意" -ForegroundColor Yellow
+} catch {
+    $probeCode = 0
+    try { $probeCode = [int]$_.Exception.Response.StatusCode } catch {}
+    if ($probeCode -eq 404) {
+        Write-Host "  ❌ /debug/fail 返回 404 —— scheduler.exe 是旧版本，未包含可靠性增强代码。" -ForegroundColor Red
+        Write-Host "  请先重新编译并重启 scheduler：" -ForegroundColor Yellow
+        Write-Host "    go build -o bin\scheduler.exe ./cmd/scheduler" -ForegroundColor Yellow
+        Write-Host "  （建议同时重编 worker/dolphinctl，随后重跑本脚本）" -ForegroundColor Yellow
+        exit 1
+    }
+    # 500 是预期响应（新代码合成失败），继续。
+}
+
 Write-Step "0. 清理旧数据"
 docker exec dolphin-mysql mysql -u root -pdolphin -e "USE dolphin; DELETE FROM task_conditions; DELETE FROM task_logs; DELETE FROM tasks;" 2>$null
 Write-Host "已清理 tasks / task_logs / task_conditions"
