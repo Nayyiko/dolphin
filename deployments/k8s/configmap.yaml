@@ -25,7 +25,8 @@ data:
       password: ""
       db: 0
     reconciler:
-      workers: 4
+      # 并发 reconcile goroutine 数，需足够高才能打满 worker 池（触发背压自动重试）。
+      workers: 50
     failover:
       heartbeat_timeout: 30s
       max_retries: 3

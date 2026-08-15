@@ -178,8 +178,10 @@ if (-not $SkipPoolFull) {
     $retryBaseC = Get-RetryMetric $M9090 "scheduled"
     $startC = Get-Date
     & "$Bins\dolphinctl.exe" --addr $SCHED stress create --count 170 --prefix "rt-C" --cron "0 0 1 1 *" --handler "http://localhost:9090/debug/sleep?seconds=2" --timeout 10 --retries 3 2>&1 | Out-Null
-    $idsC = SqlScalar "SELECT GROUP_CONCAT(id) FROM dolphin.tasks WHERE name LIKE 'rt-C-%';"
-    Write-Host "  创建 170 个 sleep(2s) 任务，触发全部"
+    # 收集 id：不能用 GROUP_CONCAT（默认 group_concat_max_len=1024，170 个 UUID
+    # ~6300 字符会被截断，导致只触发前 ~27 个，多任务场景全变假）。逐行取再 join。
+    $idsC = ((SqlRows "SELECT id FROM dolphin.tasks WHERE name LIKE 'rt-C-%';") -join ",")
+    Write-Host "  创建 170 个 sleep(2s) 任务，触发全部（实际 id 数 = $(($idsC -split ',').Count)）"
     & "$Bins\dolphinctl.exe" --addr $SCHED task trigger-batch --ids $idsC 2>&1 | Out-Null
 
     $okC = 0
@@ -221,7 +223,8 @@ for ($i = 0; $i -lt $WaitMaxSec * 2; $i++) {
     $fakeFailed = [int](SqlScalar "SELECT COUNT(*) FROM dolphin.task_logs WHERE id='stale-0001' AND status='failed' AND error_msg LIKE 'stale running%';")
     $retryLogD = [int](SqlScalar "SELECT COUNT(*) FROM dolphin.task_logs WHERE task_id='$idD' AND retry_count >= 1;")
     $succD = [int](SqlScalar "SELECT COUNT(*) FROM dolphin.task_logs WHERE task_id='$idD' AND status='success';")
-    if ($rescuedD -ge 1 -and $fakeFailed -ge 1 -and $retryLogD -ge 1) { break }
+    # 必须等 success 也落库（重试日志刚建时仍是 running，光等 retryLogD>=1 会过早 break）
+    if ($rescuedD -ge 1 -and $fakeFailed -ge 1 -and $retryLogD -ge 1 -and $succD -ge 1) { break }
     Start-Sleep -Milliseconds 500
 }
 $fakeErrD = SqlScalar "SELECT error_msg FROM dolphin.task_logs WHERE id='stale-0001';"

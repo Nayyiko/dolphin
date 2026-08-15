@@ -200,7 +200,7 @@ election:
 mysql:
   dsn: root:dolphin@tcp(localhost:3306)/dolphin?parseTime=true&charset=utf8mb4
 reconciler:
-  workers: 4         # 并行 reconcile goroutine 数
+  workers: 50        # 并行 reconcile goroutine 数（须足够高以打满 worker 池，触发背压重试）
 failover:
   heartbeat_timeout: 30s
   max_retries: 3

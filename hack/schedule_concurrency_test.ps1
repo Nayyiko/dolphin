@@ -67,10 +67,10 @@ Write-Step "1. 批量创建 $TaskCount 个任务（handler sleep $SleepSeconds s
 $startCreate = Get-Date
 & "$Bins\dolphinctl.exe" --addr "localhost:50051" stress create --count $TaskCount --prefix $NamePrefix --cron "0 0 1 1 *" --handler "http://localhost:9090/debug/sleep?seconds=$SleepSeconds" --timeout ($SleepSeconds + 5) --retries 0 2>&1 | Out-Null
 $createSec = ((Get-Date) - $startCreate).TotalSeconds
-# 收集本批任务 id（步骤 0 已清空 tasks，剩余都是本批）
-$idsRaw = SqlScalar "SELECT GROUP_CONCAT(id) FROM dolphin.tasks WHERE name LIKE '$NamePrefix%';"
-$ids = @()
-if ($idsRaw) { $ids = $idsRaw -split "," }
+# 收集本批任务 id（步骤 0 已清空 tasks，剩余都是本批）。
+# 不用 GROUP_CONCAT：默认 group_concat_max_len=1024，150+ 个 UUID 会被截断
+# 导致只触发前 ~27 个（假数据）。逐行取再 join。
+$ids = @(SqlScalar "SELECT id FROM dolphin.tasks WHERE name LIKE '$NamePrefix%';")
 $createRate = if ($createSec -gt 0) { $ids.Count / $createSec } else { 0 }
 Write-Host "  创建完成: $($ids.Count)/$TaskCount 个, 速率 $([math]::Round($createRate,1)) tasks/sec"
 Add-Content $OutFile "created=$($ids.Count) create_rate=$([math]::Round($createRate,1))"
