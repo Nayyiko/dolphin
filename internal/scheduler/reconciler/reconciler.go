@@ -676,14 +676,28 @@ func (r *Reconciler) lastRetryCount(taskID string) int {
 func (r *Reconciler) scheduleRetry(taskID string) {
 	ctx := r.getLeaderCtx()
 	if ctx == nil || ctx.Err() != nil {
+		slog.Debug("retry skipped: not leader", "task_id", taskID)
 		return // 非 Leader / 已失权：不安排重试
 	}
 
+	// 幂等去重：同一任务只允许一个"已安排的重试"在排队/执行中。
+	// 关键：retrying 标记会跨越整个下发窗口（建 log + 下发 + setCondition），
+	// 若重试已下发且其结果已回来（无运行实例），标记对"当前这个失败结果"而言
+	// 已过期——必须清除并继续调度下一步，否则快速结果会在窗口内被误吞
+	// （真实踩过的坑：失败→重试 1 次后卡住，scheduled 增量只有 1）。
 	r.retryMu.Lock()
-	if r.retrying[taskID] {
-		r.retryMu.Unlock()
-		return
+	dup := r.retrying[taskID]
+	r.retryMu.Unlock()
+	if dup {
+		if r.hasRunningInstance(ctx, taskID) {
+			slog.Debug("retry skipped: instance running, will be driven by its result",
+				"task_id", taskID)
+			return
+		}
+		// 无运行实例 → 标记对应的重试已结束，清理后继续调度下一步。
+		r.clearRetrying(taskID)
 	}
+	r.retryMu.Lock()
 	r.retrying[taskID] = true
 	r.retryMu.Unlock()
 
