@@ -133,11 +133,13 @@ func (r *Reconciler) getLeaderCtx() context.Context {
 // EnqueueTask 将任务推入协调队列（由 Informer 事件处理器调用）。
 func (r *Reconciler) EnqueueTask(taskID string) {
 	r.queue.Add(taskID)
+	metrics.SetQueueDepth(r.queue.Len())
 }
 
 // EnqueueAfter 延迟入队（预计算 cron 到期时间）。
 func (r *Reconciler) EnqueueAfter(taskID string, delay time.Duration) {
 	r.queue.AddAfter(taskID, delay)
+	metrics.SetQueueDepth(r.queue.Len())
 }
 
 // EnqueueDependents 上游任务完成时，推送直接依赖它的下游任务重新检查依赖。
@@ -370,6 +372,7 @@ func (r *Reconciler) worker(ctx context.Context) {
 		if shutdown {
 			return
 		}
+		metrics.SetQueueDepth(r.queue.Len()) // 取出一个 key，队列深度更新
 		start := time.Now()
 		err := r.reconcile(ctx, key)
 		metrics.RecordReconcile(time.Since(start))
@@ -386,6 +389,7 @@ func (r *Reconciler) worker(ctx context.Context) {
 			r.queue.Forget(key)
 		}
 		r.queue.Done(key)
+		metrics.SetQueueDepth(r.queue.Len()) // Done 后可能因 dirty 重新入队，深度同步
 	}
 }
 
@@ -565,8 +569,11 @@ func (r *Reconciler) dispatch(ctx context.Context, task *model.Task, retryCount 
 		return err
 	}
 
-	// 执行（下发 Worker）
+	// 执行（下发 Worker）。测 Send 耗时：若 gRPC 流控/worker 慢读取导致阻塞，
+	// dispatch_latency 会飙升，是"下发管道被串行化"的直接证据。
+	execStart := time.Now()
 	result, err := r.executor.Execute(ctx, task, instanceID)
+	metrics.RecordDispatchLatency(time.Since(execStart))
 	if err != nil {
 		// 下发失败（无可用 Worker/断连）：把日志标记失败，交给上层
 		// （reconcile 限速重入队 / doRetry 退避）重新调度。

@@ -212,12 +212,21 @@ if (-not $SkipPoolFull) {
     $okC = 0
     $peakExecC = 0
     $peakQueueC = 0
+    $peakInflightC = 0
+    $peakUtilC = 0
     for ($i = 0; $i -lt $WaitMaxSec * 2; $i++) {
         $okC = [int](SqlScalar "SELECT COUNT(DISTINCT l.task_id) FROM dolphin.task_logs l JOIN tasks t ON t.id=l.task_id WHERE t.name LIKE 'rt-C-%' AND l.status='success';")
         $eC = Get-Metric $M9091 "dolphin_worker_tasks_executing"
         if ($eC -gt $peakExecC) { $peakExecC = $eC }
+        # 调度 WorkQueue 深度：dolphin_scheduler_queue_depth 现在由 Reconciler 真实更新
         $qC = Get-Metric $M9090 "dolphin_scheduler_queue_depth"
         if ($qC -gt $peakQueueC) { $peakQueueC = $qC }
+        # worker 池在途数（排队+执行）与利用率：inflight ≈ executing → 下发是涓流，
+        # 瓶颈在调度器；inflight 远大于 executing → 任务堵在 worker 队列（突发下发、worker 消化慢）。
+        $iC = Get-Metric $M9091 "dolphin_worker_pool_inflight"
+        if ($iC -gt $peakInflightC) { $peakInflightC = $iC }
+        $uC = Get-Metric $M9091 "dolphin_worker_pool_capacity_utilization"
+        if ($uC -gt $peakUtilC) { $peakUtilC = $uC }
         if ($okC -ge 170) { break }
         Start-Sleep -Milliseconds 500
     }
@@ -237,8 +246,30 @@ if (-not $SkipPoolFull) {
     # 失败/超时日志总数 + 重试执行日志数（retry_count>=1）
     $failedLogC = [int](SqlScalar "SELECT COUNT(*) FROM dolphin.task_logs l JOIN tasks t ON t.id=l.task_id WHERE t.name LIKE 'rt-C-%' AND l.status IN ('failed','timeout');")
     $retryLogC = [int](SqlScalar "SELECT COUNT(*) FROM dolphin.task_logs l JOIN tasks t ON t.id=l.task_id WHERE t.name LIKE 'rt-C-%' AND l.retry_count >= 1;")
+    # ── 关键判据：下发时间跨度（首次 vs 末次 task_log 创建时间差）。
+    #    spread ~= 1s → 170 个任务几乎同时下发（突发）→ worker 侧瓶颈/池满背压应触发；
+    #    spread ~= elapsed → 下发本身涓流（调度器侧瓶颈），这就是"池满背压够不到"的直接证据。
+    $spreadC = [int](SqlScalar "SELECT COALESCE(TIMESTAMPDIFF(SECOND, MIN(start_time), MAX(start_time)), 0) FROM dolphin.task_logs l JOIN tasks t ON t.id=l.task_id WHERE t.name LIKE 'rt-C-%';")
+    # reconcile 平均耗时：dolphin_scheduler_reconcile_duration_seconds 直方图的 sum/count。
+    # 注意是全进程累计（含 A/B/D），但场景 C 占大头；若平均 ~1s+ → DB 查询慢是主因。
+    $reconcileSumC = Get-Metric $M9090 "dolphin_scheduler_reconcile_duration_seconds_sum"
+    $reconcileCountC = Get-Metric $M9090 "dolphin_scheduler_reconcile_duration_seconds_count"
+    $reconcileAvgC = "n/a"
+    if ($reconcileCountC -gt 0) { $reconcileAvgC = [math]::Round($reconcileSumC / $reconcileCountC, 3) }
+    # dispatch 直方图：dolphin_scheduler_dispatch_latency_seconds（stream.Send 耗时）。
+    $dispLatSumC = Get-Metric $M9090 "dolphin_scheduler_dispatch_latency_seconds_sum"
+    $dispLatCountC = Get-Metric $M9090 "dolphin_scheduler_dispatch_latency_seconds_count"
+    $dispLatAvgC = "n/a"
+    if ($dispLatCountC -gt 0) { $dispLatAvgC = [math]::Round($dispLatSumC / $dispLatCountC, 4) }
+    $peakQueuedC = $peakInflightC - $peakExecC
+    $dispatchRateC = "n/a"
+    if ($elapsedC -gt 0) { $dispatchRateC = [math]::Round($dispatchDeltaC / $elapsedC, 2) }
     Write-Host "  全部成功用时 ${elapsedC}s；多日志任务数 = $multiC；重试执行日志 = $retryLogC"
-    Write-Host "  诊断：下发计数增量 = $dispatchDeltaC；worker 执行峰值 = $peakExecC；调度队列峰值 = $peakQueueC；无日志任务 = $noLogC"
+    Write-Host "  诊断：下发计数增量 = $dispatchDeltaC（速率 ${dispatchRateC}/s）；worker 执行峰值 = $peakExecC；worker 在途峰值 = $peakInflightC（排队峰值 ≈ $peakQueuedC）；池利用率峰值 = $peakUtilC；调度队列峰值 = $peakQueueC；无日志任务 = $noLogC"
+    Write-Host "  时间线：下发跨度 = ${spreadC}s（突发≈1s / 涓流≈总时长）；reconcile 平均 = ${reconcileAvgC}s；dispatch Send 平均 = ${dispLatAvgC}s"
+    Add-Content $OutFile "  C 时间线: elapsed=${elapsedC}s spread=${spreadC}s reconcile_avg=${reconcileAvgC}s dispatch_send_avg=${dispLatAvgC}s"
+    Add-Content $OutFile "  C 诊断: dispatch=$dispatchDeltaC(${dispatchRateC}/s) peak_exec=$peakExecC peak_inflight=$peakInflightC peak_queued≈$peakQueuedC peak_util=$peakUtilC peak_queue_depth=$peakQueueC noLog=$noLogC"
+    Add-Content $OutFile "  C 背压: pool_rejected=$poolRejDeltaC retry_scheduled=$retryDeltaC retry_dispatched=$retryDispDeltaC retry_dispatch_failed=$retryFailDispDeltaC stale=$staleDeltaC multi=$multiC"
     Write-Host "  背压：池满拒绝增量 = $poolRejDeltaC；retry_total scheduled=$retryDeltaC dispatched=$retryDispDeltaC dispatch_failed=$retryFailDispDeltaC；stale 救援 = $staleDeltaC"
     Write-Host "  失败/超时日志 = $failedLogC，按 error_msg 分组："
     $errRows = SqlRows "SELECT l.error_msg, COUNT(*) FROM dolphin.task_logs l JOIN tasks t ON t.id=l.task_id WHERE t.name LIKE 'rt-C-%' AND l.status IN ('failed','timeout') GROUP BY l.error_msg;"

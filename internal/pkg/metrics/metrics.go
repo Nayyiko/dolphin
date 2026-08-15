@@ -134,6 +134,17 @@ var (
 		},
 	)
 
+	// 下发耗时：Reconciler 调 executor.Execute → stream.Send 到 worker 的耗时。
+	// 若 Send 因 gRPC 流控/worker 读得慢而阻塞，这里会显示高延迟（毫秒级甚至秒级），
+	// 直接暴露"下发管道被串行化"这一瓶颈（场景 C 排查用）。
+	SchedulerDispatchLatency = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "dolphin_scheduler_dispatch_latency_seconds",
+			Help:    "Time spent sending one task dispatch to a worker (stream.Send).",
+			Buckets: []float64{.0005, .001, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5},
+		},
+	)
+
 	// Reconcile 耗时
 	SchedulerReconcileDuration = promauto.NewHistogram(
 		prometheus.HistogramOpts{
@@ -260,6 +271,18 @@ var (
 		},
 	)
 
+	// Worker 池在途数：current_load = 正在执行 + 排队等待的任务数。
+	// 配合 dolphin_worker_tasks_executing 可推出排队数 = inflight - executing：
+	//   - inflight 高（接近 150 上限）而 executing 低 → 任务堵在 worker 队列（下发是突发、worker 消化慢）
+	//   - inflight ≈ executing → worker 队列空（下发是涓流，瓶颈在调度器侧）
+	// 场景 C 排查"池满背压为何不触发"的关键判据。
+	WorkerPoolInflight = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "dolphin_worker_pool_inflight",
+			Help: "Current number of tasks queued or executing in the worker pool (current_load).",
+		},
+	)
+
 	// Worker 心跳延迟
 	WorkerHeartbeatLatency = promauto.NewHistogram(
 		prometheus.HistogramOpts{
@@ -301,6 +324,22 @@ func RecordDispatch(handlerType string, lag time.Duration, success bool) {
 	}
 	SchedulerDispatchTotal.WithLabelValues(handlerType, result).Inc()
 	SchedulerTaskLag.Observe(lag.Seconds())
+}
+
+// RecordDispatchLatency 记录一次下发到 worker 的耗时（stream.Send）。
+// 高值说明 gRPC 下发管道被流控/慢读取阻塞，是场景 C 排查的关键信号。
+func RecordDispatchLatency(d time.Duration) {
+	SchedulerDispatchLatency.Observe(d.Seconds())
+}
+
+// SetQueueDepth 更新调度 WorkQueue 中待处理的 key 数。
+func SetQueueDepth(n int) {
+	SchedulerQueueDepth.Set(float64(n))
+}
+
+// SetWorkerPoolInflight 更新 worker 池在途任务数（排队 + 执行）。
+func SetWorkerPoolInflight(n int64) {
+	WorkerPoolInflight.Set(float64(n))
 }
 
 // RecordReconcile reconcile 循环耗时。

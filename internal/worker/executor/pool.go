@@ -98,6 +98,7 @@ func (p *Pool) Submit(task *TaskDispatch) bool {
 	select {
 	case p.taskCh <- task:
 		p.currentLoad.Add(1)
+		metrics.SetWorkerPoolInflight(p.currentLoad.Load())
 		return true
 	default:
 		return false
@@ -109,13 +110,20 @@ func (p *Pool) CurrentLoad() int {
 	return int(p.currentLoad.Load())
 }
 
+// updatePoolMetrics 同步池利用率与在途数 gauge（currentLoad = 排队 + 执行）。
+func (p *Pool) updatePoolMetrics() {
+	load := p.currentLoad.Load()
+	metrics.SetWorkerPoolInflight(load)
+	metrics.WorkerPoolUtilization.Set(float64(load) / float64(p.capacity))
+}
+
 // execute 执行单个任务，带超时控制。
 func (p *Pool) execute(task *TaskDispatch) {
 	defer p.currentLoad.Add(-1)
-	// 更新池利用率指标
-	metrics.WorkerPoolUtilization.Set(float64(p.CurrentLoad()) / float64(p.capacity))
+	// 更新池利用率 + 在途数指标
+	p.updatePoolMetrics()
 	defer func() {
-		metrics.WorkerPoolUtilization.Set(float64(p.CurrentLoad()) / float64(p.capacity))
+		p.updatePoolMetrics()
 	}()
 
 	metrics.RecordWorkerTaskStarted()
