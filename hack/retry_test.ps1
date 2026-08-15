@@ -80,7 +80,7 @@ function Get-DispatchMetric {
 # MySQL 单值查询（去掉末尾换行）
 function SqlScalar {
     param([string]$Q)
-    $r = docker exec dolphin-mysql mysql -u root -pdolphin -N -e $Q 2>$null
+    $r = docker exec dolphin-mysql mysql -u root -pdolphin -D dolphin -N -e $Q 2>$null
     if ($null -eq $r) { return "" }
     return $r.ToString().Trim()
 }
@@ -104,7 +104,7 @@ function MetricValue {
 # MySQL 多行查询（每行按 Tab 拆列）
 function SqlRows {
     param([string]$Q)
-    $r = docker exec dolphin-mysql mysql -u root -pdolphin -N -e $Q 2>$null
+    $r = docker exec dolphin-mysql mysql -u root -pdolphin -D dolphin -N -e $Q 2>$null
     return $r
 }
 
