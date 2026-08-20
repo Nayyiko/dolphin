@@ -7,7 +7,7 @@
 
 ## 一句话总结
 
-"一个 Go 分布式调度系统的 CI/CD：3 个 job 串成门禁——**静态检查+单元测试+覆盖率门禁** → **4 个多阶段 Docker 镜像可构建** → **在 kind 真实集群里跑完整 E2E**（网关可达 / 双调度器选主单主 / 任务真实执行），期间用 CI 抓出并修掉了一个 MySQL 就绪探针的真实故障。"
+"一个 Go 分布式调度系统的 CI/CD：3 个 job 串成门禁——**静态检查+单元测试+覆盖率门禁** → **4 个多阶段 Docker 镜像可构建** → **在 kind 真实集群里跑完整 E2E**（网关可达 / 双调度器选主单主 / 任务真实执行），期间用 CI 抓出并修掉了两个真实故障：MySQL 就绪探针 socket 路径错误、kind 冷启动 scheduler 就绪超时抖动。"
 
 ---
 
@@ -110,10 +110,11 @@ push / PR
 ### E2E 里的工程细节（全是面试料）
 
 1. **失败不盲等，失败时打印诊断**：`wait_ready` 超时后输出 `get pods -o wide` + `describe pod` + `logs --tail=200`，让 CI 失败可自解释。
-2. **冷环境预拉基础设施镜像**：CI runner 首次冷跑时，kubelet 才从 Docker Hub/quay 拉 mysql/etcd/redis，冷拉大镜像 + 匿名拉取限流（`toomanyrequests`）曾实测 mysql 360s 起不来 → 预拉进 runner Docker 再 `kind load`，运行时零外网依赖。
+2. **冷环境预拉基础设施镜像**：CI runner 首次冷跑时，kubelet 才从 Docker Hub/quay 拉 mysql/etcd/redis，冷拉大镜像 + 匿名拉取限流（`toomanyrequests`）曾实测 mysql 360s 起不来 → 预拉进 runner Docker 再 `kind load`，运行时零外网依赖。**pull 失败的镜像跳过预加载**（不要无条件 `kind load`——镜像不存在会让 load 直接失败），运行时由 kubelet 拉取兜底。
 3. **`kubectl apply -k deployments/k8s`**：用 Kustomize 组织全部清单（namespace + etcd + mysql + redis + configmap + 三组件），一条命令幂等部署。
 4. **V3 的坑：不能用 `stress trigger --id X --count N`**：它只是把同一任务 `next_run_at` 刷 N 次，informer 只见一次变更 → 等效只执行 1 次（曾跑出 4/450 的假象）。正确做法是建 N 个独立任务再 `trigger-batch`。
 5. **探针修复故事（真实故障，CI 抓出来的）**：mysql readinessProbe 原为 `mysqladmin ping -h localhost`——mysql:8.0 的 socket 实际在 `/var/lib/mysql/mysql.sock`，而 `-h localhost` 找 `/var/run/mysqld/mysqld.sock`，导致 pod 永远不 Ready（日志 34 次 probe failed）。改为 `-h 127.0.0.1 -P 3306` 走 TCP，与应用/initContainer 一致。**CI run #18 全绿**。
+6. **偶发就绪超时的容错 + 可诊断（run #20 排障）**：kind 冷启动时 scheduler 的 `wait-for-infra` init 容器在 mysql/etcd/redis 已 Ready 后仍轮询了 ~2m17s（CoreDNS/服务就绪抖动），把主进程启动推到 150s 就绪超时边缘，一个副本再撞上一次重启就红了。修复分两层：**容错**——scheduler 就绪等待 150s→300s（与 mysql 600s 的"首启容错"口径一致），worker/gateway 同步放宽；**可诊断**——init 容器改为逐依赖轮询并打印"正在等谁"，失败诊断补上 init 容器状态与日志。**CI run #22 全绿。教训：CI 里偶发抖动要"给足容错 + 失败可自解释"，而不是把超时设到恰好能过。**
 
 > **面试口径**："最典型的 CI 排障：集群里 mysql 一直不 Ready，日志显示 34 次 readiness probe failed。根因是探针用 `-h localhost` 走了 Unix socket 路径，而 mysql:8.0 的 socket 不在默认位置——改成 TCP 127.0.0.1:3306 后 pod 正常 Ready。这个 bug 单机 docker-compose 复现不了，是上集群才暴露的，正好体现 E2E 的价值。"
 
@@ -136,6 +137,9 @@ worker 暴露 `dolphin_worker_task_completed_total` 计数，脚本汇总所有 
 ### Q: CI 有缓存/推送镜像吗？
 当前**只构建不推送**（无 registry push）；`kind load` 满足 E2E 需要，镜像发布留作部署阶段。这是明确的已知边界，也是可扩展点（接入 GHCR + 自动部署）。
 
+### Q: E2E 偶发红过吗？怎么处理？
+红过（run #20）：scheduler 就绪超时。诊断发现根因不是应用崩溃——是 kind 冷启动时 init 容器等依赖的轮询抖动，把主进程启动推到超时边缘，一个副本再撞一次重启就差了那几秒。处理分两层：**容错**——把 scheduler 就绪等待从 150s 放宽到 300s（跟 mysql 首启 600s 一个口径，都是给冷启动留余量）；**可诊断**——init 容器改成逐依赖打日志，失败诊断补 init 容器状态，下次卡住能直接看出在等 mysql 还是 etcd 还是 redis。这比"把超时设到恰好能过"更稳——那是靠运气，给余量 + 能自解释才是靠工程。
+
 ---
 
 ## 已知边界与待改进
@@ -147,10 +151,10 @@ worker 暴露 `dolphin_worker_task_completed_total` 计数，脚本汇总所有 
 | 覆盖率 | 聚合 56.8% 门禁 50% | 可加单包最低线，防"一个包拉满、其他全空" |
 | kind 拓扑 | 单节点 | 多节点 kind 测跨节点网络/分区 |
 | E2E 覆盖 | V1/V2/V3 | 可加 V4 背压 / V5 kill worker 重分发（本地版已有，见 k8s-kind-check.md） |
-| 镜像预拉容错 | `kind load` 无条件执行，pull 失败会中断 | 改为"pull 失败则跳过 load，容忍运行时拉取" |
+| 镜像预拉容错 | 已修复：pull 失败跳过 load，运行时 kubelet 兜底 | — |
 
 ---
 
 ## 30 秒面试口径（背这句）
 
-"Dolphin 的 CI/CD 分三个门禁：先 `go vet` + race 单元测试 + 覆盖率门禁（核心逻辑包 ≥50%），再构建 4 个多阶段、非 root 的 Docker 镜像，最后在 kind 真实集群里跑 E2E——验证网关可达、双调度器 etcd 选主单主、worker 经 etcd 发现真实 Leader 并执行 10 个任务。期间 CI 帮我抓出一个真实故障：mysql 探针 socket 路径不对导致 pod 永不 Ready，改成 TCP 探测后全绿。整个设计原则是快速失败、失败可诊断、E2E 验证的是可观测结果而不是'部署成功'。"
+"Dolphin 的 CI/CD 分三个门禁：先 `go vet` + race 单元测试 + 覆盖率门禁（核心逻辑包 ≥50%），再构建 4 个多阶段、非 root 的 Docker 镜像，最后在 kind 真实集群里跑 E2E——验证网关可达、双调度器 etcd 选主单主、worker 经 etcd 发现真实 Leader 并执行 10 个任务。期间 CI 帮我抓出并修掉两个真实故障：mysql 探针 socket 路径不对导致 pod 永不 Ready（改成 TCP 探测）、kind 冷启动 scheduler 偶发就绪超时（放宽超时 + 逐依赖日志兜底）。整个设计原则是快速失败、失败可诊断、E2E 验证的是可观测结果而不是'部署成功'。"
