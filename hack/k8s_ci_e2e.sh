@@ -49,8 +49,12 @@ kind delete cluster --name "$Cluster" 2>/dev/null || true
 kind create cluster --name "$Cluster"
 
 # ---------- 2. 默认 StorageClass（防御：kind 默认没有） ----------
+# 判断标准：存在 annotation storageclass.kubernetes.io/is-default-class=true 的 SC，
+# 而不是靠名字里碰 "default" 字串——名字可能叫 standard/local-path 等。
 Stage "检查 StorageClass"
-if kubectl get storageclass 2>/dev/null | grep -q default; then
+if kubectl get storageclass \
+     -o jsonpath='{.items[*].metadata.annotations.storageclass\.kubernetes\.io/is-default-class}' \
+     2>/dev/null | grep -q true; then
   OK "已有默认 StorageClass"
 else
   Info "无默认 SC，安装 local-path-provisioner（hostPath）"
@@ -83,13 +87,22 @@ OK "镜像已加载"
 # CI 冷环境的关键：不预拉的话，kubelet 在 pod 调度时才从 Docker Hub/quay 拉
 # mysql/etcd/redis，冷拉大镜像 + 匿名拉取限流（toomanyrequests）会拖到超时
 #（曾实测 mysql 360s 未 Ready）。预拉进 runner Docker + kind load，运行时零外网依赖。
+# ⚠️ pull 失败的镜像跳过预加载（不要无条件 kind load——镜像不存在会让 load 直接失败）：
+#    清单里 imagePullPolicy 默认 IfNotPresent，节点上没镜像时 kubelet 会运行时拉取兜底。
 Stage "预拉基础设施镜像并加载进 kind"
 infra_images=(mysql:8.0 quay.io/coreos/etcd:v3.5.14 redis:7-alpine)
+loaded=()
 for img in "${infra_images[@]}"; do
-  docker pull "$img" >/dev/null 2>&1 || Info "预拉 $img 失败（可能限流），将依赖运行时拉取"
+  if docker pull "$img" >/dev/null 2>&1; then
+    loaded+=("$img")
+  else
+    Info "预拉 $img 失败（可能限流），跳过预加载，运行时由 kubelet 拉取兜底"
+  fi
 done
-kind load docker-image --name "$Cluster" "${infra_images[@]}"
-OK "基础设施镜像已加载（mysql/etcd/redis）"
+if [ "${#loaded[@]}" -gt 0 ]; then
+  kind load docker-image --name "$Cluster" "${loaded[@]}"
+fi
+OK "基础设施镜像预加载完成（${#loaded[@]}/${#infra_images[@]}）"
 
 # ---------- 4. 部署 ----------
 Stage "部署 (kubectl apply -k deployments/k8s)"
@@ -155,12 +168,14 @@ worker_metric() {
 }
 
 Stage "V3 · 建 10 个任务并全部触发（worker 经 etcd 找到真实 Leader 并执行）"
-go build -o bin/dolphinctl ./cmd/dolphinctl
+# 编译到临时目录，避免在仓库根目录残留 bin/ 污染工作区（即使 .gitignore 覆盖了 bin/）
+ctl_bin="$(mktemp -d)/dolphinctl"
+go build -o "$ctl_bin" ./cmd/dolphinctl
 kubectl -n "$NS" port-forward svc/dolphin-scheduler 50051:50051 >/dev/null 2>&1 &
 pf_pids+=($!)
 sleep 5
 
-ctl() { ./bin/dolphinctl --addr localhost:50051 "$@"; }
+ctl() { "$ctl_bin" --addr localhost:50051 "$@"; }
 
 ctl stress create --count 10 --prefix ci-e2e --cron "0 0 1 1 *" \
   --handler "http://dolphin-scheduler:9090/debug/sleep?seconds=1" \
