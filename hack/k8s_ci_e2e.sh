@@ -104,7 +104,7 @@ wait_ready() {
     Info "$label 未在 ${timeout} 内 Ready，打印诊断："
     kubectl -n "$NS" get pods -o wide
     kubectl -n "$NS" describe pod -l "app=$label" | tail -40
-    kubectl -n "$NS" logs -l "app=$label" --tail=40 2>&1 || true
+    kubectl -n "$NS" logs -l "app=$label" --tail=200 2>&1 || true
     Fail "$label 未就绪"
   fi
 }

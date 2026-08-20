@@ -43,8 +43,12 @@ spec:
             - name: data
               mountPath: /var/lib/mysql
           readinessProbe:
+            # 用 TCP 探测，避免依赖 socket 路径：CI 里 mysql:8.0 实际 socket 在
+            # /var/lib/mysql/mysql.sock，而 `-h localhost` 找 /var/run/mysqld/mysqld.sock，
+            # 导致 pod 永远 Ready 不了（日志里有 34 次 Readiness probe failed）。
+            # 应用与 initContainer 都走 TCP 3306，探针应与之保持一致。
             exec:
-              command: ["mysqladmin", "ping", "-h", "localhost"]
+              command: ["mysqladmin", "ping", "-h", "127.0.0.1", "-P", "3306"]
             initialDelaySeconds: 20
             periodSeconds: 10
             timeoutSeconds: 5
