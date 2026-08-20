@@ -49,14 +49,15 @@ kubectl -n dolphin get pods -w
 kubectl -n dolphin get svc
 curl http://<node-ip>:30080/health          # gateway 可达
 kubectl -n dolphin exec deploy/gateway -- sh -c \
-  'wget -qO- http://dolphin-scheduler:9090/healthz'   # scheduler 健康
+  'curl -s http://dolphin-scheduler:9090/healthz'   # scheduler 健康
 ```
 
 ## 使用
 
 ```bash
 # 在集群内执行管理命令（用 scheduler Service 地址）
-kubectl -n dolphin run ctl --rm -it --image=dolphinctl:latest --restart=Never -- \
+# 前置：镜像已构建并加载进集群（kind: kind load docker-image --name <集群名> dolphinctl:latest）
+kubectl -n dolphin run ctl --rm -it --image=dolphinctl:latest --image-pull-policy=IfNotPresent --restart=Never -- \
   --addr dolphin-scheduler:50051 task create --name demo \
   --cron "*/1 * * * *" --handler http://dolphin-gateway:8080/health
 
@@ -65,7 +66,7 @@ kubectl -n dolphin port-forward svc/dolphin-scheduler 50051:50051 &
 ./bin/dolphinctl --addr localhost:50051 task list
 ```
 
-> 注意：本仓库未构建 dolphinctl 镜像。可用 `docker build -t dolphinctl:latest -f deployments/docker/Dockerfile.dolphinctl .`（需先补该 Dockerfile），或直接 `kubectl port-forward` 后用本机二进制。
+> dolphinctl 镜像：`make dolphinctl-image` 即可构建（Dockerfile 在 `deployments/docker/Dockerfile.dolphinctl`）。kind 需要先 `kind load docker-image dolphinctl:latest`，minikube 用 `minikube image load dolphinctl:latest`。也可以 `kubectl port-forward` 后用本机二进制。
 
 ## 部署后的面试硬数据
 
@@ -79,6 +80,18 @@ kubectl -n dolphin port-forward svc/dolphin-scheduler 50051:50051 &
 | 限流多实例共享 | 两个 gateway 副本同时打，观察放行数不翻倍 | 共享 Redis 令牌桶（证据 4b） |
 | DAG | 跑 `hack/dag_test.ps1` 三连 | 环检测/事件驱动延迟/新鲜度 |
 | 故障转移 | `kubectl delete pod <scheduler-leader>` 观察新 Leader 接管 | etcd 租约 15s 内接管 |
+
+## CI/CD（.github/workflows/ci.yml）
+
+每次 push / PR 自动跑三阶段流水线，全部通过才算绿：
+
+| 阶段 | 内容 | 失败影响 |
+|------|------|---------|
+| `lint-and-test` | go vet + 单测(race) + 覆盖率 ≥ 50% + 全量编译（含 4 个二进制） | 阻断后续 |
+| `build-images` | 构建 4 个 Dockerfile（gateway/scheduler/worker/dolphinctl）并 inspect 确认 | 阻断 e2e |
+| `k8s-e2e` | `hack/k8s_ci_e2e.sh`：起 kind → 装 local-path SC → 构建/加载镜像 → 部署 → V1 网关可达 / V2 选主单主 / V3 任务真实执行 | 部署质量门禁 |
+
+本地复跑 e2e：Linux 用 `bash hack/k8s_ci_e2e.sh`，Windows 用 `powershell -ExecutionPolicy Bypass -File hack/k8s_kind_up.ps1`。
 
 ## 关键设计决策（面试讲法）
 

@@ -2,16 +2,22 @@ name: CI/CD
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
   pull_request:
-    branches: [main]
+    branches: [main, master]
   workflow_dispatch:
 
 env:
   GO_VERSION: "1.26"
+  KIND_VERSION: "v0.32.0"
+  KUBECTL_VERSION: "v1.32.0"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  # ═══ Stage 1: Lint & Test — 快速失败 ═══
+  # ═══════════ Stage 1: Lint & Test — 快速失败门禁 ═══════════
   lint-and-test:
     name: Lint & Test
     runs-on: ubuntu-latest
@@ -28,7 +34,7 @@ jobs:
       - name: Go Vet
         run: go vet ./...
 
-      - name: Unit Tests
+      - name: Unit Tests (race)
         run: go test -race -count=1 -coverprofile=coverage.out ./...
 
       - name: Coverage Check
@@ -46,14 +52,40 @@ jobs:
           fi
           echo "✅ Coverage $COVERAGE% meets threshold"
 
-      - name: Build Check
-        run: go build ./...
+      - name: Build Check (all binaries)
+        run: |
+          go build ./...
+          go build -o bin/gateway    ./cmd/gateway
+          go build -o bin/scheduler  ./cmd/scheduler
+          go build -o bin/worker     ./cmd/worker
+          go build -o bin/dolphinctl ./cmd/dolphinctl
+          echo "Built: $(ls bin/)"
 
-  # ═══ Stage 2: 构建产物可编译的二进制 ═══
-  build-binaries:
-    name: Build Binaries
+  # ═══════════ Stage 2: Docker 镜像可构建 ═══════════
+  build-images:
+    name: Build Docker Images
     runs-on: ubuntu-latest
     needs: lint-and-test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build 4 images
+        run: |
+          docker build -t dolphin-gateway:latest   -f deployments/docker/Dockerfile.gateway   .
+          docker build -t dolphin-scheduler:latest -f deployments/docker/Dockerfile.scheduler .
+          docker build -t dolphin-worker:latest    -f deployments/docker/Dockerfile.worker    .
+          docker build -t dolphinctl:latest        -f deployments/docker/Dockerfile.dolphinctl .
+
+      - name: Verify images
+        run: docker image inspect dolphin-gateway:latest dolphin-scheduler:latest dolphin-worker:latest dolphinctl:latest >/dev/null
+
+  # ═══════════ Stage 3: 真实集群 E2E（kind）═══════════
+  k8s-e2e:
+    name: K8s E2E (kind)
+    runs-on: ubuntu-latest
+    needs: [lint-and-test, build-images]
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -64,9 +96,18 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: Build all components
+      - name: Install kind
         run: |
-          go build -o bin/gateway ./cmd/gateway
-          go build -o bin/scheduler ./cmd/scheduler
-          go build -o bin/worker ./cmd/worker
-          echo "Built: $(ls bin/)"
+          curl -sSLo /tmp/kind "https://kind.sigs.k8s.io/dl/${{ env.KIND_VERSION }}/kind-linux-amd64"
+          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+          kind version
+
+      - name: Install kubectl
+        run: |
+          curl -sSL -o /tmp/kubectl "https://dl.k8s.io/release/${{ env.KUBECTL_VERSION }}/bin/linux/amd64/kubectl"
+          sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+          kubectl version --client
+
+      # 一键脚本：起 kind → 构建/加载镜像 → 部署 → V1 网关 / V2 选主 / V3 任务执行
+      - name: K8s E2E
+        run: bash hack/k8s_ci_e2e.sh

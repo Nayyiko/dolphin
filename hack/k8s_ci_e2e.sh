@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# ============================================================
+# k8s_ci_e2e.sh — Dolphin 一键 K8s 端到端验证（Linux / CI）
+#
+# 用法（dolphin 仓库根目录）:
+#   bash hack/k8s_ci_e2e.sh
+#
+# 流程: 起 kind → 装默认 SC(如缺) → 构建/加载镜像 → apply -k →
+#       V1 网关可达 / V2 选主单主 / V3 任务真实执行(advertise_addr)
+#
+# 与 Windows 版 hack/k8s_kind_up.ps1 等价，供 GitHub Actions 与本地 Linux 复用。
+# 跑完保留集群，方便手动复核；CI 环境用完即弃，本地可 `kind delete cluster --name dolphin` 清理。
+# ============================================================
+set -euo pipefail
+
+Cluster="dolphin"
+NS="dolphin"
+Root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$Root"
+
+Imgs=(
+  "dolphin-gateway:latest deployments/docker/Dockerfile.gateway"
+  "dolphin-scheduler:latest deployments/docker/Dockerfile.scheduler"
+  "dolphin-worker:latest deployments/docker/Dockerfile.worker"
+  "dolphinctl:latest deployments/docker/Dockerfile.dolphinctl"
+)
+
+pf_pids=()
+cleanup() {
+  for pid in "${pf_pids[@]:-}"; do kill "$pid" 2>/dev/null || true; done
+}
+trap cleanup EXIT
+
+Stage() { echo "[$(date +%H:%M:%S)] $*"; }
+OK()    { echo "  [OK] $*"; }
+Fail()  { echo "  [FAIL] $*"; exit 1; }
+Info()  { echo "  [..] $*"; }
+
+# ---------- 0. 前置 ----------
+Stage "前置检查"
+for c in docker kind kubectl go; do
+  command -v "$c" >/dev/null || Fail "缺少 $c"
+done
+OK "docker/kind/kubectl/go 齐备"
+
+# ---------- 1. 起 kind ----------
+Stage "起 kind 集群 ($Cluster)"
+kind delete cluster --name "$Cluster" 2>/dev/null || true
+kind create cluster --name "$Cluster"
+
+# ---------- 2. 默认 StorageClass（防御：kind 默认没有） ----------
+Stage "检查 StorageClass"
+if kubectl get storageclass 2>/dev/null | grep -q default; then
+  OK "已有默认 StorageClass"
+else
+  Info "无默认 SC，安装 local-path-provisioner（hostPath）"
+  kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.26/deploy/local-path-storage.yaml >/dev/null
+  kubectl annotate storageclass local-path storageclass.kubernetes.io/is-default-class=true >/dev/null
+  OK "local-path 已设为默认"
+fi
+
+# ---------- 3. 构建 + 加载 ----------
+Stage "构建 4 个镜像"
+for spec in "${Imgs[@]}"; do
+  set -- $spec
+  docker build -q -t "$1" -f "$2" .
+  docker image inspect "$1" >/dev/null
+  OK "$1 构建完成"
+done
+
+Stage "加载镜像进 kind 节点"
+kind load docker-image --name "$Cluster" \
+  dolphin-gateway:latest dolphin-scheduler:latest dolphin-worker:latest dolphinctl:latest
+OK "镜像已加载"
+
+# ---------- 4. 部署 ----------
+Stage "部署 (kubectl apply -k deployments/k8s)"
+kubectl apply -k deployments/k8s
+OK "apply 完成，等待就绪（mysql 首次初始化最慢）"
+
+Stage "等待全部 Pod Ready"
+kubectl -n "$NS" wait --for=condition=Ready pod -l app=mysql     --timeout=360s
+kubectl -n "$NS" wait --for=condition=Ready pod -l app=etcd      --timeout=120s
+kubectl -n "$NS" wait --for=condition=Ready pod -l app=redis     --timeout=120s
+kubectl -n "$NS" wait --for=condition=Ready pod -l app=scheduler --timeout=120s
+kubectl -n "$NS" wait --for=condition=Ready pod -l app=worker    --timeout=120s
+kubectl -n "$NS" wait --for=condition=Ready pod -l app=gateway   --timeout=120s
+kubectl -n "$NS" get pods
+OK "全部 1/1 Ready"
+
+# ---------- 5. V1: 网关可达 ----------
+Stage "V1 · 网关可达（port-forward 8080 → /health）"
+kubectl -n "$NS" port-forward svc/dolphin-gateway 8080:8080 >/dev/null 2>&1 &
+pf_pids+=($!)
+sleep 5
+code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://localhost:8080/health || true)"
+if [ "$code" = "200" ]; then OK "gateway /health 返回 200"; else Fail "gateway /health 返回 ${code:-N/A}"; fi
+
+# ---------- 6. V2: 选主单主 ----------
+Stage "V2 · 双 scheduler etcd 选主（应只有一个 is_leader=1）"
+leader=0
+for p in $(kubectl -n "$NS" get pod -l app=scheduler -o jsonpath='{.items[*].metadata.name}'); do
+  v="$(kubectl -n "$NS" exec "$p" -- sh -c 'curl -s http://localhost:9090/metrics' 2>/dev/null \
+       | grep '^dolphin_scheduler_is_leader ' | awk '{print $NF}' || true)"
+  Info "$p is_leader=$v"
+  if [ "$v" = "1" ]; then leader=$((leader+1)); fi
+done
+if [ "$leader" = "1" ]; then OK "恰好 1 个 Leader（防脑裂）"; else Fail "Leader 数=$leader（应=1）"; fi
+
+# ---------- 7. V3: 任务真实执行（advertise_addr 验证） ----------
+# 方法：stress create 建 N 个独立任务再 trigger-batch 全部触发。
+# ⚠️ 不能用 `stress trigger --id X --count N`：它只把同一任务 next_run_at 刷 N 次，
+# informer 只见一次变更 → 等效触发 1 次执行（曾跑出 4/450 的假象）。
+
+# 汇总所有 worker 的指定指标（数据行，非 # 注释行）之和
+worker_metric() {
+  local pattern="$1" total=0 p val
+  for p in $(kubectl -n "$NS" get pod -l app=worker -o jsonpath='{.items[*].metadata.name}'); do
+    while read -r line; do
+      val="${line##* }"
+      [[ "$val" =~ ^[0-9]+$ ]] && total=$((total + val))
+    done < <(kubectl -n "$NS" exec "$p" -- sh -c 'curl -s http://localhost:9091/metrics' 2>/dev/null \
+               | grep "^$pattern" || true)
+  done
+  echo "$total"
+}
+
+Stage "V3 · 建 10 个任务并全部触发（worker 经 etcd 找到真实 Leader 并执行）"
+go build -o bin/dolphinctl ./cmd/dolphinctl
+kubectl -n "$NS" port-forward svc/dolphin-scheduler 50051:50051 >/dev/null 2>&1 &
+pf_pids+=($!)
+sleep 5
+
+ctl() { ./bin/dolphinctl --addr localhost:50051 "$@"; }
+
+ctl stress create --count 10 --prefix ci-e2e --cron "0 0 1 1 *" \
+  --handler "http://dolphin-scheduler:9090/debug/sleep?seconds=1" \
+  --timeout 30 --retries 3 >/dev/null
+sleep 1
+ids="$(ctl task list --limit 500 | grep 'name=ci-e2e' | sed -n 's/^id=\([^ ]*\).*/\1/p' | paste -sd, -)"
+if [ -z "$ids" ]; then Fail "拿不到 ci-e2e 任务 id"; fi
+Info "已建 $(echo "$ids" | tr ',' '\n' | wc -l | tr -d ' ') 个任务，全部触发"
+ctl task trigger-batch --ids "$ids" >/dev/null
+
+base="$(worker_metric dolphin_worker_task_completed_total)"
+Info "等待 10 个完成（最多 90s）…"
+deadline=$(( $(date +%s) + 90 ))
+while :; do
+  now="$(worker_metric dolphin_worker_task_completed_total)"
+  if [ $((now - base)) -ge 10 ]; then break; fi
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    Fail "10 个任务未在 90s 内完成（Δ=$((now-base))）"
+  fi
+  sleep 5
+done
+OK "10/10 完成，worker 经 etcd 找到真实 Leader 并执行（advertise_addr 生效）"
+
+# ---------- 8. 汇总 ----------
+Stage "完成"
+kubectl -n "$NS" get pods
+cat <<'EOF'
+
+  ✅ Dolphin 已在 kind 集群上跑通
+  V1 网关可达      -> 已确认
+  V2 选主单主      -> 已确认（1 个 Leader）
+  V3 任务真实执行  -> 已确认（advertise_addr 生效）
+
+  面试口径:
+  "CI 里起 kind 真实集群，构建并加载镜像后部署 Dolphin——gateway 可达、
+   双 scheduler 单主、worker 经 etcd 发现真实 Leader 并执行任务。"
+EOF

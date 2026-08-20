@@ -18,6 +18,14 @@ spec:
       labels:
         app: scheduler
     spec:
+      # 等待依赖就绪再启动主容器：scheduler 启动时连不上 MySQL 会直接退出（fail-fast），
+      # mysql:8.0 首次初始化 hostPath 卷要 ~90s，之前每次新部署 scheduler 都崩溃重启 ~90s。
+      # initContainer 用已加载的 scheduler 镜像（alpine 自带 busybox nc）轮询等待三个依赖端口。
+      initContainers:
+        - name: wait-for-infra
+          image: dolphin-scheduler:latest
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "until nc -z dolphin-mysql 3306 && nc -z dolphin-etcd 2379 && nc -z dolphin-redis 6379; do echo 'waiting infra...'; sleep 2; done"]
       containers:
         - name: scheduler
           image: dolphin-scheduler:latest
