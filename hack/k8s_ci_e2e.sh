@@ -56,6 +56,12 @@ else
   Info "无默认 SC，安装 local-path-provisioner（hostPath）"
   kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.26/deploy/local-path-storage.yaml >/dev/null
   kubectl annotate storageclass local-path storageclass.kubernetes.io/is-default-class=true >/dev/null
+  # 预拉 provisioner 镜像并加载，避免 PVC 绑定等它的运行时拉取
+  lpimg="$(kubectl get deploy -n local-path-storage local-path-provisioner -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
+  if [ -n "$lpimg" ]; then
+    docker pull "$lpimg" >/dev/null 2>&1 || true
+    kind load docker-image --name "$Cluster" "$lpimg" >/dev/null 2>&1 || true
+  fi
   OK "local-path 已设为默认"
 fi
 
@@ -73,18 +79,41 @@ kind load docker-image --name "$Cluster" \
   dolphin-gateway:latest dolphin-scheduler:latest dolphin-worker:latest dolphinctl:latest
 OK "镜像已加载"
 
+# ---------- 3.5 预拉基础设施镜像并加载 ----------
+# CI 冷环境的关键：不预拉的话，kubelet 在 pod 调度时才从 Docker Hub/quay 拉
+# mysql/etcd/redis，冷拉大镜像 + 匿名拉取限流（toomanyrequests）会拖到超时
+#（曾实测 mysql 360s 未 Ready）。预拉进 runner Docker + kind load，运行时零外网依赖。
+Stage "预拉基础设施镜像并加载进 kind"
+infra_images=(mysql:8.0 quay.io/coreos/etcd:v3.5.14 redis:7-alpine)
+for img in "${infra_images[@]}"; do
+  docker pull "$img" >/dev/null 2>&1 || Info "预拉 $img 失败（可能限流），将依赖运行时拉取"
+done
+kind load docker-image --name "$Cluster" "${infra_images[@]}"
+OK "基础设施镜像已加载（mysql/etcd/redis）"
+
 # ---------- 4. 部署 ----------
 Stage "部署 (kubectl apply -k deployments/k8s)"
 kubectl apply -k deployments/k8s
 OK "apply 完成，等待就绪（mysql 首次初始化最慢）"
 
 Stage "等待全部 Pod Ready"
-kubectl -n "$NS" wait --for=condition=Ready pod -l app=mysql     --timeout=360s
-kubectl -n "$NS" wait --for=condition=Ready pod -l app=etcd      --timeout=120s
-kubectl -n "$NS" wait --for=condition=Ready pod -l app=redis     --timeout=120s
-kubectl -n "$NS" wait --for=condition=Ready pod -l app=scheduler --timeout=120s
-kubectl -n "$NS" wait --for=condition=Ready pod -l app=worker    --timeout=120s
-kubectl -n "$NS" wait --for=condition=Ready pod -l app=gateway   --timeout=120s
+# 等待单个应用组就绪，失败时打印诊断（pod 状态 + describe + 日志），避免盲等超时
+wait_ready() {
+  local label="$1" timeout="$2"
+  if ! kubectl -n "$NS" wait --for=condition=Ready pod -l "app=$label" --timeout="$timeout"; then
+    Info "$label 未在 ${timeout} 内 Ready，打印诊断："
+    kubectl -n "$NS" get pods -o wide
+    kubectl -n "$NS" describe pod -l "app=$label" | tail -40
+    kubectl -n "$NS" logs -l "app=$label" --tail=40 2>&1 || true
+    Fail "$label 未就绪"
+  fi
+}
+wait_ready mysql 420s
+wait_ready etcd 120s
+wait_ready redis 120s
+wait_ready scheduler 150s
+wait_ready worker 150s
+wait_ready gateway 120s
 kubectl -n "$NS" get pods
 OK "全部 1/1 Ready"
 
