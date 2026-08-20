@@ -1,6 +1,6 @@
 # Dolphin — 构建系统
 
-.PHONY: help proto lint test test-cover bench build build-linux docker-build infra-up infra-down run-gateway run-scheduler run-worker smoke bench-gateway bench-schedule failover k8s-images k8s-apply k8s-delete clean
+.PHONY: help proto lint test test-cover bench build build-linux docker-build infra-up infra-down run-gateway run-scheduler run-worker smoke bench-gateway bench-schedule failover k8s-images k8s-apply k8s-delete dolphinctl-image clean
 
 APP_NAME := dolphin
 REGISTRY := docker.io/$(USER)
@@ -120,6 +120,9 @@ k8s-apply: ## 部署 Dolphin 到 K8s（需 kubectl + 集群）
 
 k8s-delete: ## 卸载 K8s 部署
 	kubectl delete -k deployments/k8s
+
+dolphinctl-image: ## 构建管理 CLI 镜像（集群内跑 dolphinctl 用，非部署组件）
+	docker build -t dolphinctl:latest -f deployments/docker/Dockerfile.dolphinctl .
 
 clean: ## 清理构建产物
 	rm -rf bin/

@@ -1,0 +1,31 @@
+# Git
+.git
+.gitignore
+
+# 本地编译产物（Windows 二进制，73M，不能进镜像）
+bin/
+*.exe
+*.test
+
+# 测试/压测产物
+results/
+results.bin
+coverage.out
+coverage.html
+targets.txt
+
+# 求职材料（不进镜像）
+docs/get-job/
+
+# 非镜像所需的本地方案副本
+configs/*2.yaml
+configs/gateway_bench.yaml
+
+# IDE/OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~

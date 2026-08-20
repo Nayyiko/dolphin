@@ -1,0 +1,39 @@
+# ============================================================
+# 多阶段构建：dolphinctl 管理 CLI 镜像
+# 用法: docker build -t dolphinctl:latest -f deployments/docker/Dockerfile.dolphinctl .
+# 用途: 在 K8s 集群内执行管理命令（task create/list/trigger、stress 等）
+# 说明: dolphinctl 是纯 CLI（flag 传 --addr），无需 config 文件；main 未定义
+#       Version/BuildTime/GitCommit 变量，故不做 -X 版本注入（仅 strip）。
+# ============================================================
+
+# ── Stage 1: Build ──
+FROM golang:1.26-alpine AS builder
+
+RUN apk add --no-cache git ca-certificates
+
+WORKDIR /build
+
+# 先拷贝依赖（利用 Docker 层缓存）
+COPY go.mod go.sum ./
+RUN go mod download
+
+# 拷贝源码
+COPY . .
+
+# 静态编译（CGO 关闭），strip 调试信息
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
+    -ldflags="-s -w" \
+    -o /build/bin/dolphinctl ./cmd/dolphinctl
+
+# ── Stage 2: Runtime ──
+# 纯 CLI 工具：alpine + ca-certificates（gRPC 走 TLS 兜底），无需用户/配置
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates tzdata \
+    && mkdir -p /app
+
+WORKDIR /app
+
+COPY --from=builder /build/bin/dolphinctl /app/dolphinctl
+
+ENTRYPOINT ["./dolphinctl"]
