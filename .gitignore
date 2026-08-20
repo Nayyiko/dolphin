@@ -36,3 +36,6 @@ vendor/
 # Python
 __pycache__/
 *.pyc
+
+# 求职材料（含个人简历信息，只放本地/桌面，不进 public 仓库）
+docs/get-job/

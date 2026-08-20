@@ -108,7 +108,7 @@ wait_ready() {
     Fail "$label 未就绪"
   fi
 }
-wait_ready mysql 420s
+wait_ready mysql 600s
 wait_ready etcd 120s
 wait_ready redis 120s
 wait_ready scheduler 150s
