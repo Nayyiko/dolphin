@@ -111,12 +111,18 @@ OK "apply 完成，等待就绪（mysql 首次初始化最慢）"
 
 Stage "等待全部 Pod Ready"
 # 等待单个应用组就绪，失败时打印诊断（pod 状态 + describe + 日志），避免盲等超时
+# 超时给足余量：kind 冷启动时 scheduler 的 wait-for-infra init 容器要等
+# CoreDNS 就绪 + 三个依赖端口可达，曾实测 ~2m17s（见 run #20 修复记录）。
 wait_ready() {
   local label="$1" timeout="$2"
   if ! kubectl -n "$NS" wait --for=condition=Ready pod -l "app=$label" --timeout="$timeout"; then
     Info "$label 未在 ${timeout} 内 Ready，打印诊断："
     kubectl -n "$NS" get pods -o wide
-    kubectl -n "$NS" describe pod -l "app=$label" | tail -40
+    kubectl -n "$NS" describe pod -l "app=$label" | tail -60
+    # 容器状态精炼提取（init + 主容器），重点看 State / Last State / Exit Code / Restart Count
+    kubectl -n "$NS" describe pod -l "app=$label" | grep -E -A7 '^    (Init Containers:|Containers:)' || true
+    # init 容器（wait-for-infra）日志：scheduler 会逐依赖打印正在等待谁，直接定位卡点
+    kubectl -n "$NS" logs -l "app=$label" -c wait-for-infra --tail=50 2>&1 || true
     kubectl -n "$NS" logs -l "app=$label" --tail=200 2>&1 || true
     Fail "$label 未就绪"
   fi
@@ -124,9 +130,9 @@ wait_ready() {
 wait_ready mysql 600s
 wait_ready etcd 120s
 wait_ready redis 120s
-wait_ready scheduler 150s
-wait_ready worker 150s
-wait_ready gateway 120s
+wait_ready scheduler 300s
+wait_ready worker 240s
+wait_ready gateway 180s
 kubectl -n "$NS" get pods
 OK "全部 1/1 Ready"
 
