@@ -22,7 +22,6 @@
 | 12 | 协程池 | goroutine 池有必要吗？ | 防无界 goroutine，per-task context 超时 |
 | 13 | SLO | 怎么衡量质量？ | 可用性 99.95%、调度新鲜度 P99<2s、成功率 99.9% |
 | 14 | 负载均衡 | 为什么 least_conn？ | 轮询不考虑真实负载，心跳上报 current_load |
-| 15 | CI/CD 流水线 | 为什么用 kind 做 E2E？ | 真实集群验证"可观测结果"而非"部署成功"；三阶段门禁 + 两个真实故障的排障见 [ci-cd.md](ci-cd.md) |
 
 ## 高频追问
 
